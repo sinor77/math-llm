@@ -3,12 +3,12 @@
 # ============================================================
 # Core deep-learning stack
 torch==2.2.2
-torchvision==0.17.2          # pulled in by torch ecosystem; not directly used
-torchaudio==0.17.2            # same
 
 # Dataset access
-datasets==2.19.2              # HuggingFace Datasets — used to stream mandubian/pytorch_math_dataset
-huggingface_hub==0.23.4
+# No version pins on huggingface packages — pin conflicts with Colab's
+# pre-installed transformers, peft, gradio, and diffusers.
+datasets
+huggingface_hub
 
 # Numerics / science
 numpy==1.26.4
