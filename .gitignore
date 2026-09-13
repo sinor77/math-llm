@@ -1,0 +1,45 @@
+# ── Checkpoints and model weights ─────────────────────────────────────────
+checkpoints/*
+!checkpoints/.gitkeep
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# ── Dataset cache (large, re-downloadable) ────────────────────────────────
+data_cache/
+data_processed/
+__pycache__/
+*.pyc
+*.pyo
+
+# ── Results (generated at runtime) ────────────────────────────────────────
+# The directory is tracked via .gitkeep so `mkdir` isn't needed after clone.
+# Once you have a real run, add results explicitly:
+#   git add -f results/eval_results.json results/training_history.json
+results/*
+!results/.gitkeep
+
+# ── Python environment ────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Jupyter ───────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ── OS noise ──────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Editor ────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
