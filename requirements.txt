@@ -5,10 +5,12 @@
 torch==2.2.2
 
 # Dataset access
-# No version pins on huggingface packages — pin conflicts with Colab's
-# pre-installed transformers, peft, gradio, and diffusers.
-datasets
-huggingface_hub
+# The real dataset (DeepMind Mathematics Dataset, Saxton et al. 2019) is
+# downloaded directly from its official static-file source
+# (storage.googleapis.com) using only the Python standard library
+# (urllib, tarfile) — see dataset.py. No HuggingFace `datasets` /
+# `huggingface_hub` dependency is needed, which also removes a whole class
+# of Colab package-version conflicts those libraries used to cause.
 
 # Numerics / science
 numpy==1.26.4

@@ -230,10 +230,18 @@ if __name__ == "__main__":
     assert out.shape == (B, T, D), "Shape mismatch!"
     print("CausalSelfAttention self-test passed.")
 
-    # Test with Flash Attention if available
+    # Test with Flash Attention if available.
+    # IMPORTANT: must compare the SAME weights through both code paths —
+    # constructing a second module would draw fresh random weights from
+    # the RNG stream and make the "diff" meaningless (any two independently
+    # initialised modules will produce wildly different outputs regardless
+    # of whether the attention math is correct). We instead flip the
+    # use_flash flag on the existing module and copy state_dict across.
     if hasattr(F, "scaled_dot_product_attention"):
         attn_flash = CausalSelfAttention(d_model=D, n_heads=H, max_seq_len=T,
                                           dropout=0.0, use_flash=True)
+        attn_flash.load_state_dict(attn.state_dict())
         out_flash = attn_flash(x)
         diff = (out - out_flash).abs().max().item()
-        print(f"Flash vs manual max diff: {diff:.2e}  (should be < 1e-5)")
+        print(f"Flash vs manual max diff (same weights): {diff:.2e}  (should be < 1e-5)")
+        assert diff < 1e-4, "Flash and manual attention implementations disagree!"

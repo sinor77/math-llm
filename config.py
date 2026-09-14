@@ -125,27 +125,70 @@ class DataConfig:
     """
     Controls which data we load and how we split it.
 
-    The dataset is sourced from mandubian/pytorch_math_dataset on
-    HuggingFace Hub.  Each record has the form:
-        {"question": "...", "answer": "...", "type": "arithmetic__add_or_sub"}
+    REAL DATA SOURCE
+    ----------------
+    This project uses the actual DeepMind Mathematics Dataset published
+    alongside Saxton, Grefenstette, Hill & Kohli, "Analysing Mathematical
+    Reasoning Abilities of Neural Models" (ICLR 2019).  The dataset is NOT
+    a normal HuggingFace Hub dataset repo — earlier versions of this file
+    pointed at 'deepcode-ai/math_dataset' and 'WillHeld/deepmind-math',
+    neither of which exists / works, which is why training silently fell
+    back to synthetic data.
 
-    We build our own strict train / val / test splits so that the test
-    set is NEVER seen during training.
+    The real, verified, authoritative source is the static tarball the
+    authors published themselves:
+
+        https://storage.googleapis.com/mathematics-dataset/mathematics_dataset-v1.0.tar.gz
+        (2.3 GB, sha-verified by size; last-modified 2019-08-07; contains
+        the exact category files named below, one question+answer pair
+        per two lines of text)
+
+    Directory layout inside the tarball (verified by inspection):
+        train-easy/<category>.txt   — easiest difficulty, used for TRAIN/VAL
+        train-medium/<category>.txt — harder curriculum (optional, Stage 2+)
+        train-hard/<category>.txt   — hardest curriculum (optional)
+        interpolate/<category>.txt  — official held-out TEST split: same
+                                       categories, disjoint questions,
+                                       generated independently by the
+                                       original authors. We use this as our
+                                       genuinely-unseen test set instead of
+                                       carving a test split out of the
+                                       training pool ourselves.
+        extrapolate/<category>.txt  — harder out-of-distribution eval
+                                       (bigger numbers / longer expressions)
+
+    We build our own train/val split (hash-based, deterministic) from
+    train-easy; the test split always comes from interpolate/ and is never
+    touched during training.
     """
 
-    # ---- HuggingFace dataset identifiers ---------------------------------
-    # Primary  : deepcode-ai/math_dataset  (per-category config, 2M rows/cat)
-    # Secondary: WillHeld/deepmind-math    (flat combined, 'category' column)
-    # Both are mirrors of the DeepMind Mathematics Dataset (Saxton et al. 2019)
-    # The original 'mandubian/pytorch_math_dataset' is a GitHub repo, not a Hub
-    # dataset — load_dataset() on it will fail.
-    hf_dataset_name: str = "deepcode-ai/math_dataset"
+    # ---- Real dataset source (see docstring above) -------------------------
+    dataset_url: str = (
+        "https://storage.googleapis.com/mathematics-dataset/"
+        "mathematics_dataset-v1.0.tar.gz"
+    )
+    dataset_archive_name: str = "mathematics_dataset-v1.0"
+    # Expected uncompressed size of the tarball in bytes — used to sanity
+    # check a cached download before trusting it (an interrupted/corrupt
+    # download will not match).  ~2.33 GB, verified via a HEAD request.
+    dataset_expected_size_bytes: int = 2_333_082_954
+    train_difficulty: str = "train-easy"     # train-easy | train-medium | train-hard
+    test_difficulty: str = "interpolate"     # official held-out split
 
     # ---- Which math categories to include (progressive) -------------------
+    # Category names must match real file names inside the tarball exactly
+    # (verified by listing the archive — see the module docstring).
+    # NOTE: 'arithmetic__mul_or_div' does NOT exist in the real dataset —
+    # multiplication and division are separate categories/files
+    # ('arithmetic__mul' and 'arithmetic__div'). Earlier versions of this
+    # config used the wrong, made-up name, which silently produced empty
+    # category loads.
+    #
     # Stage 1 — start here to get the pipeline working quickly.
     categories_stage1: List[str] = field(default_factory=lambda: [
         "arithmetic__add_or_sub",
-        "arithmetic__mul_or_div",
+        "arithmetic__mul",
+        "arithmetic__div",
         "arithmetic__mixed",
     ])
 
@@ -170,18 +213,23 @@ class DataConfig:
     # Active categories (set by experiments.py or overridden directly).
     active_categories: List[str] = field(default_factory=lambda: [
         "arithmetic__add_or_sub",
-        "arithmetic__mul_or_div",
+        "arithmetic__mul",
+        "arithmetic__div",
         "arithmetic__mixed",
     ])
 
-    # ---- Split ratios -------------------------------------------------------
-    train_ratio: float = 0.80
+    # ---- Split ratios (train/val ONLY — test comes from interpolate/) ------
+    # The real test set is the official 'interpolate' split (see docstring
+    # above), which is disjoint from train-easy by construction. We only
+    # need to further split train-easy into train/val ourselves.
+    train_ratio: float = 0.90
     val_ratio: float = 0.10
-    test_ratio: float = 0.10   # must sum to 1.0 with train + val
 
-    # ---- Per-category sample cap -------------------------------------------
-    # Cap samples per category so early stages are fast.
+    # ---- Per-category sample caps -------------------------------------------
+    # Cap samples per category so early stages are fast. train-easy files
+    # contain ~666K lines per category; interpolate files contain ~10K.
     max_samples_per_category: int = 5_000
+    max_test_samples_per_category: int = 1_000
 
     # ---- Sequence length filtering ----------------------------------------
     max_seq_len: int = 256        # drop examples longer than this
@@ -287,5 +335,5 @@ if __name__ == "__main__":
     print(f"  lr={tc.learning_rate}  batch={tc.batch_size}  steps={tc.max_steps}")
     print("\nDefault DataConfig:")
     dc = DataConfig()
-    print(f"  dataset={dc.hf_dataset_name}")
+    print(f"  dataset_url={dc.dataset_url}")
     print(f"  active categories: {dc.active_categories}")

@@ -153,6 +153,7 @@ def save_checkpoint(
     keep_last_n: int = 3,
     is_best: bool = False,
     tag: str = "",
+    data_source_info: Optional[Dict] = None,
 ) -> str:
     """
     Save a training checkpoint.
@@ -177,6 +178,7 @@ def save_checkpoint(
         "cfg_train":       cfg_train_dict,
         "tokenizer_path":  tokenizer_path,
         "timestamp":       datetime.utcnow().isoformat(),
+        "data_source_info": data_source_info or {},
     }
     torch.save(payload, filename)
     log.info(f"Checkpoint saved → {filename}  (val_loss={val_loss:.4f})")
@@ -216,8 +218,10 @@ def load_checkpoint(
     model.load_state_dict(ckpt["model_state"])
     if optimizer is not None and "optimizer_state" in ckpt:
         optimizer.load_state_dict(ckpt["optimizer_state"])
+    val_loss = ckpt.get("val_loss")
+    val_loss_str = f"{val_loss:.4f}" if isinstance(val_loss, (int, float)) else "?"
     log.info(f"Checkpoint loaded ← {path}  "
-             f"(step={ckpt.get('step', '?')}  val_loss={ckpt.get('val_loss', '?'):.4f})")
+             f"(step={ckpt.get('step', '?')}  val_loss={val_loss_str})")
     return ckpt
 
 
@@ -250,16 +254,28 @@ def token_accuracy(
     Returns
     -------
     Accuracy as a float in [0, 1]
+
+    IMPORTANT — causal shift:
+    The model at position i predicts the token at position i+1 (see
+    model.py's forward(), which computes the loss as
+    logits[:, :-1] vs labels[:, 1:]). This function must apply the exact
+    same shift, or it silently compares each position's prediction of the
+    NEXT token against the CURRENT token's label — an off-by-one mismatch
+    that makes the reported accuracy meaningless (near-random) even when
+    the model has actually learned the task perfectly under the (correctly
+    shifted) loss.
     """
-    # Predicted token is the argmax of logits
-    preds = logits.argmax(dim=-1)   # (B, T)
+    shift_logits = logits[:, :-1, :]   # (B, T-1, V)
+    shift_labels = labels[:, 1:]        # (B, T-1)
+
+    preds = shift_logits.argmax(dim=-1)   # (B, T-1)
 
     # Only evaluate on non-masked positions
-    mask  = labels != -100          # (B, T) bool
+    mask  = shift_labels != -100          # (B, T-1) bool
     if mask.sum() == 0:
         return 0.0
 
-    correct = (preds == labels) & mask
+    correct = (preds == shift_labels) & mask
     return correct.sum().item() / mask.sum().item()
 
 

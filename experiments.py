@@ -61,7 +61,7 @@ from config import (
     get_model_config, get_train_config,
 )
 from tokenizer import MathTokenizer
-from dataset import load_raw_data, split_data
+from dataset import load_split_dataset
 from model import MathLLM
 from train import train
 from evaluate import evaluate_exact_answer, evaluate_token_accuracy, full_evaluation
@@ -299,9 +299,8 @@ def run_experiment(
     tok_path  = raw.get("tokenizer_path", os.path.join("checkpoints", "tokenizer.json"))
     tokenizer = MathTokenizer.load(tok_path)
 
-    # Rebuild val items
-    by_category = load_raw_data(data_cfg)
-    _, val_items, _ = split_data(by_category, data_cfg)
+    # Rebuild val items (real dataset; cached tarball makes this cheap)
+    _, val_items, _, _ = load_split_dataset(data_cfg)
 
     gen_results = evaluate_exact_answer(
         model=model,
@@ -520,7 +519,7 @@ def analyse_failures(results_path: str = "results/eval_results.json") -> None:
 # Quick-start: single stage-1 baseline (for Colab / first run)
 # ---------------------------------------------------------------------------
 
-def quick_start(device: str = "cuda") -> Dict:
+def quick_start(device: str = "cuda", dry_run: bool = False) -> Dict:
     """
     Run a single baseline experiment with small-2M on Stage-1 data.
     Good entry point for a first run on Colab.
@@ -538,7 +537,7 @@ def quick_start(device: str = "cuda") -> Dict:
         max_steps=10_000,
         description="Quick-start baseline",
     )
-    return run_experiment(spec, exp_log, device=device)
+    return run_experiment(spec, exp_log, device=device, dry_run=dry_run)
 
 
 # ---------------------------------------------------------------------------
@@ -563,7 +562,7 @@ if __name__ == "__main__":
     if args.analyse:
         analyse_failures()
     elif args.quick:
-        quick_start(device=args.device)
+        quick_start(device=args.device, dry_run=args.dry_run)
     else:
         # Filter experiments by stage prefix if requested
         stage_map = {"A": 0, "B": 1, "C": 2, "D": 3, "E": 4}
