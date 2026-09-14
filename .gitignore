@@ -1,6 +1,11 @@
 # ── Checkpoints and model weights ─────────────────────────────────────────
 checkpoints/*
 !checkpoints/.gitkeep
+# Alternate/experiment checkpoint dirs (e.g. train_cfg.checkpoint_dir set to
+# something other than "checkpoints/" — experiments.py does this per-run,
+# and so does ad-hoc local testing) — same rationale as checkpoints/ above,
+# just not sharing its literal name.
+checkpoints_*/
 *.pt
 *.pth
 *.bin
