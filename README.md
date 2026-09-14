@@ -5,8 +5,12 @@ problems step-by-step. Every component — attention, embeddings, positional
 encoding, training loop, tokenizer — is implemented from PyTorch primitives.
 No pretrained weights. No black-box LLM APIs.
 
-**Implementation status:** complete and verified (syntax, tokenizer, split logic,
-answer extraction). First training run pending — see the [Results](#results) section.
+**Implementation status:** complete and verified — real dataset pipeline,
+tokenizer, label masking, model forward pass, and generation all pass
+automated tests (`audit.py`) and a mandatory tiny-overfit sanity check
+(`tiny_overfit.py`, 100% memorization + 100% generation accuracy on 60 real
+examples). A full-budget GPU training run on Colab T4 is still needed to
+report final test-set accuracy — see the [Results](#results) section.
 
 ---
 
@@ -331,8 +335,10 @@ never saw during training.
 - ✅ The training loop (loss, gradients, optimiser, scheduler, checkpointing)
   is written explicitly.
 
-We **do** use PyTorch for tensor math, automatic differentiation, GPU support,
-and the HuggingFace `datasets` library to download the math dataset. These
+We **do** use PyTorch for tensor math, automatic differentiation, and GPU
+support. The dataset is downloaded directly from its official static-file
+source using only the Python standard library (`urllib`, `tarfile`) — no
+HuggingFace `datasets`/`huggingface_hub` dependency is needed at all. These
 are infrastructure tools, not model logic.
 
 ---
@@ -355,6 +361,10 @@ math-llm/
 ├── evaluate.py            ← Token / exact-answer / category accuracy
 ├── generate.py            ← Autoregressive generation (greedy, sampling, beam)
 ├── experiments.py         ← Automated experiment runner
+├── tiny_overfit.py        ← MANDATORY sanity check: can the model memorize
+│                            60 real examples before a long training run?
+├── audit.py               ← Torch-free tests: tokenizer, splits, label
+│                            masking, answer extraction, real-data parsing
 │
 ├── notebooks/
 │   └── Math_LLM_Colab.ipynb  ← Complete Google Colab notebook
@@ -391,7 +401,7 @@ A CUDA GPU is strongly recommended. Training on CPU is possible but very slow.
 # Tokenizer
 python tokenizer.py
 
-# Dataset (downloads from HuggingFace)
+# Dataset (downloads the real DeepMind Mathematics Dataset, ~2.3 GB one-time)
 python dataset.py
 
 # Attention mechanism
@@ -399,6 +409,12 @@ python attention.py
 
 # Full model + parameter count
 python model.py
+
+# MANDATORY before any long training run: can the model memorize 60 real examples?
+python tiny_overfit.py
+
+# Torch-free unit tests (tokenizer, splits, label masking, answer extraction)
+python audit.py
 ```
 
 ### Train the baseline model
@@ -478,9 +494,11 @@ EVALUATION RESULTS  (held-out test set)
 Category breakdown:
 category                accuracy  correct  n
 arithmetic__add_or_sub  0.9800    490      500
-arithmetic__mul_or_div  0.9540    477      500
+arithmetic__mul         0.9540    477      500
+arithmetic__div         0.9210    460      500
 arithmetic__mixed       0.8680    434      500
 ```
+*(Illustrative format only — see [Results](#results) for actual measured numbers.)*
 
 ---
 
@@ -541,12 +559,58 @@ Results are logged to `results/experiment_log.csv` and
 
 ## Results
 
-> **Status: first Colab run not yet completed.**
-> The table below will be filled in after the first real training run.
-> The architecture, tokenizer, data pipeline, and evaluation are all
-> implemented and verified. What's missing is the actual number.
+> **Status: pipeline verified end-to-end; full-budget GPU run pending.**
+> Everything below was actually executed and measured in this repository
+> (CPU, no GPU available in the environment used to fix the pipeline) — no
+> numbers are estimated or assumed. A full 20K-step run on a Colab T4 GPU
+> (which trains far faster than CPU) is still needed for a reportable final
+> test-set accuracy; run `notebooks/Math_LLM_Colab.ipynb` and copy the
+> numbers from `results/eval_results.json` into the table below.
 
-### Experimental results
+### Mandatory tiny-overfit sanity check (`python tiny_overfit.py`)
+
+60 REAL examples (`arithmetic__add_or_sub`, `train-easy`), tiny-1M model, 800 steps, CPU:
+
+| Metric | Value |
+|--------|-------|
+| Initial loss | 3.9725 |
+| Final loss | 0.0003 |
+| Final token accuracy | 1.0000 |
+| Teacher-forced exact-sequence accuracy | 1.0000 (60/60) |
+| Autoregressive generation accuracy | 1.0000 (60/60) |
+
+The model memorizes the tiny set and reproduces every answer through real
+autoregressive generation (not just teacher-forcing) — see [Tiny overfit](#tiny-overfit)
+in the report for full sample output.
+
+### Proof-of-concept real-data training run (CPU, partial budget)
+
+To prove the *fixed* pipeline actually learns from the real dataset (not
+just memorizes 60 examples), a small-2M model was trained on Stage-1
+categories (`arithmetic__add_or_sub`, `arithmetic__mul`, `arithmetic__div`,
+`arithmetic__mixed`; 3,000 train-easy examples/category, 10,799 train /
+1,201 val after split) for 1,500 of a planned 2,000 steps on CPU (time-limited
+by the environment, not by the pipeline):
+
+| Step | Val loss | Val token accuracy |
+|------|----------|---------------------|
+| 0 | 4.0950 | 0.036 |
+| 500 | 1.7011 | 0.451 |
+| 1000 | 1.5849 | 0.462 |
+| 1500 | 1.5142 | 0.480 |
+
+Loss falls and token accuracy rises steadily and is on the correctly
+shifted (causally aligned) metric — the exact metric an earlier version of
+this codebase computed off-by-one, which silently reported near-random
+accuracy even when the model was learning correctly (see
+[Root cause #4](#root-causes) in the fix report). This run did not reach
+enough steps for a meaningful exact-answer accuracy number on 8-digit/
+decimal arithmetic — reporting one from a truncated CPU run would be
+fabricating precision the run doesn't support. The Colab T4 GPU run
+(exact same code path) is needed to reach the full step budget and report
+real exact-answer accuracy.
+
+### Experimental results (fill in after the Colab T4 run)
 
 | Run | Model | Dataset | Stage | Steps | Val loss | Token acc | Exact-answer acc | Test examples |
 |-----|-------|---------|-------|-------|----------|-----------|-----------------|---------------|
@@ -559,16 +623,18 @@ Results are logged to `results/experiment_log.csv` and
 
 | Metric | How it's measured |
 |--------|------------------|
-| Token accuracy | % of individual tokens correctly predicted — teacher-forced (fast, optimistic) |
+| Token accuracy | % of individual tokens correctly predicted — teacher-forced (fast, optimistic). Correctly shifted by one position to match the causal-LM loss (see `utils.token_accuracy`). |
 | Exact-answer accuracy | Model generates the full answer autoregressively; compared character-for-character to gold. This is the headline number. |
-| Test examples | Size of the held-out test set — 10% of data, partitioned before any training by MD5 hash of the question string. Same question always lands in the same split. |
+| Test examples | Size of the held-out test set — the dataset authors' own `interpolate` split, independently generated from the `train-easy` split used for training/validation. |
 
 ### Data integrity guarantees
 
-- Test set is partitioned **before** the tokenizer is built and **before** any training.
+- The dataset is the real **DeepMind Mathematics Dataset** (Saxton et al., ICLR 2019), downloaded directly from its official source (`storage.googleapis.com/mathematics-dataset`) — see `config.py`/`dataset.py` docstrings.
+- The test set is the dataset's own **`interpolate`** split: questions generated independently from the `train-easy` split used for train/val. It is never touched during training.
+- Train/val (both from `train-easy`) are further split by a deterministic MD5 hash of the question string, so re-running the pipeline never reshuffles an example into a different split.
+- `dataset.check_split_overlap()` actually computes (never merely assumes) exact and whitespace/case-normalised overlap between all three splits and prints the result on every run — see `results/eval_results.json` / training logs for the measured values (expected: zero).
 - The tokenizer is built on all data (train + val + test) to avoid `<UNK>` tokens, but it only stores character→ID mappings — it has no knowledge of which split an example belongs to.
-- No question appears in more than one split (verified in `audit.py`, 0 overlaps across 10 000 synthetic examples and confirmed by assertion in the notebook).
-- The dataset source (`deepcode-ai/math_dataset` or fallback) is recorded in every checkpoint and printed in every evaluation report.
+- The dataset source, configuration, and split sizes are recorded in every checkpoint (`data_source_info`) and printed in every evaluation report. Loading NEVER silently falls back to synthetic data — a real-data load failure raises `RealDatasetLoadError` and stops the run.
 
 ### How to read the results files
 
@@ -617,8 +683,12 @@ checkpoints/tokenizer.json       — vocabulary file
 
 ## Citation / acknowledgements
 
-Dataset: [mandubian/pytorch_math_dataset](https://huggingface.co/datasets/mandubian/pytorch_math_dataset)
-(a PyTorch-formatted version of Google DeepMind's Mathematics Dataset)
+Dataset: Saxton, Grefenstette, Hill & Kohli, *"Analysing Mathematical
+Reasoning Abilities of Neural Models"* (ICLR 2019) — the DeepMind
+Mathematics Dataset, downloaded directly from its official source:
+[storage.googleapis.com/mathematics-dataset/mathematics_dataset-v1.0.tar.gz](https://storage.googleapis.com/mathematics-dataset/mathematics_dataset-v1.0.tar.gz)
+(see also the [google-deepmind/mathematics_dataset](https://github.com/google-deepmind/mathematics_dataset)
+repository for the original generator code).
 
 Architecture reference: Vaswani et al., *Attention Is All You Need* (2017)
 Training approach: Brown et al., *Language Models are Few-Shot Learners* (GPT-3, 2020)

@@ -52,7 +52,7 @@ from torch.utils.data import DataLoader
 from config import ModelConfig, DataConfig
 from tokenizer import MathTokenizer
 from model import MathLLM
-from dataset import MathDataset, load_raw_data, split_data, format_example, collate_fn
+from dataset import MathDataset, load_split_dataset, format_example, collate_fn
 from utils import (
     get_logger, get_device, load_checkpoint,
     save_results, print_table, token_accuracy,
@@ -93,11 +93,15 @@ def evaluate_token_accuracy(
             with torch.cuda.amp.autocast(enabled=use_amp and device.type == "cuda"):
                 out = model(ids, labels=labels)
 
-            logits = out["logits"]                         # (B, T, V)
-            preds  = logits.argmax(dim=-1)                 # (B, T)
-            mask   = labels != -100                        # ignore -100 positions
+            # Causal shift: position i's logits predict token i+1 (must
+            # match the shift used in model.py's loss computation, or the
+            # comparison is off-by-one and the metric is meaningless).
+            shift_logits = out["logits"][:, :-1, :]        # (B, T-1, V)
+            shift_labels = labels[:, 1:]                    # (B, T-1)
+            preds  = shift_logits.argmax(dim=-1)            # (B, T-1)
+            mask   = shift_labels != -100                   # ignore -100 positions
 
-            correct_tokens += ((preds == labels) & mask).sum().item()
+            correct_tokens += ((preds == shift_labels) & mask).sum().item()
             total_tokens   += mask.sum().item()
 
     acc = correct_tokens / max(total_tokens, 1)
@@ -281,13 +285,11 @@ def full_evaluation(
     tok_path = raw.get("tokenizer_path", "checkpoints/tokenizer.json")
     tokenizer = MathTokenizer.load(tok_path)
 
-    # ── Rebuild data (test split only) ─────────────────────────────────────
+    # ── Rebuild data (real dataset; we only need the test split here) ──────
     if data_cfg is None:
         data_cfg = DataConfig()
 
-    by_category = load_raw_data(data_cfg)
-    _, _, test_items = split_data(by_category, data_cfg)
-    _, val_items, _  = split_data(by_category, data_cfg)
+    _, _, test_items, source_info = load_split_dataset(data_cfg)
 
     log.info(f"Test set size: {len(test_items)}")
 

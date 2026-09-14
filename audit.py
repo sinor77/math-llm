@@ -401,8 +401,49 @@ dc = DataConfig()
 all_cats = dc.categories_stage1 + dc.categories_stage2 + dc.categories_stage3
 check("5. no duplicate categories across stages",
       len(all_cats) == len(set(all_cats)))
-check("5. train+val+test ratios sum to 1.0",
-      abs(dc.train_ratio + dc.val_ratio + dc.test_ratio - 1.0) < 1e-9)
+check("5. train+val ratios sum to 1.0 (test comes from the separate "
+      "'interpolate' split, not a ratio of train-easy)",
+      abs(dc.train_ratio + dc.val_ratio - 1.0) < 1e-9)
+
+# 5b. Category names must match REAL file names inside the DeepMind
+# Mathematics Dataset tarball. This list was verified by directly listing
+# the contents of https://storage.googleapis.com/mathematics-dataset/
+# mathematics_dataset-v1.0.tar.gz (train-easy/ directory), NOT guessed.
+# This check exists because an earlier version of this config used the
+# invented name 'arithmetic__mul_or_div', which does not exist in the real
+# dataset (the real categories are 'arithmetic__mul' and 'arithmetic__div'
+# separately) and silently produced empty category loads.
+REAL_TRAIN_EASY_CATEGORIES = {
+    "algebra__linear_1d", "algebra__linear_1d_composed",
+    "algebra__linear_2d", "algebra__linear_2d_composed",
+    "algebra__polynomial_roots", "algebra__polynomial_roots_composed",
+    "algebra__sequence_next_term", "algebra__sequence_nth_term",
+    "arithmetic__add_or_sub", "arithmetic__add_or_sub_in_base",
+    "arithmetic__add_sub_multiple", "arithmetic__div", "arithmetic__mixed",
+    "arithmetic__mul", "arithmetic__mul_div_multiple",
+    "arithmetic__nearest_integer_root", "arithmetic__simplify_surd",
+    "calculus__differentiate", "calculus__differentiate_composed",
+    "comparison__closest", "comparison__closest_composed",
+    "comparison__kth_biggest", "comparison__kth_biggest_composed",
+    "comparison__pair", "comparison__pair_composed",
+    "comparison__sort", "comparison__sort_composed",
+    "measurement__conversion", "measurement__time",
+    "numbers__base_conversion", "numbers__div_remainder",
+    "numbers__div_remainder_composed", "numbers__gcd", "numbers__gcd_composed",
+    "numbers__is_factor", "numbers__is_factor_composed", "numbers__is_prime",
+    "numbers__is_prime_composed", "numbers__lcm", "numbers__lcm_composed",
+    "numbers__list_prime_factors", "numbers__list_prime_factors_composed",
+    "numbers__place_value", "numbers__place_value_composed",
+    "numbers__round_number", "numbers__round_number_composed",
+    "polynomials__add", "polynomials__coefficient_named",
+    "polynomials__collect", "polynomials__compose", "polynomials__evaluate",
+    "polynomials__evaluate_composed", "polynomials__expand",
+    "polynomials__simplify_power", "probability__swr_p_level_set",
+    "probability__swr_p_sequence",
+}
+bad_cats = [c for c in all_cats if c not in REAL_TRAIN_EASY_CATEGORIES]
+check("5b. every configured category is a real dataset file name",
+      len(bad_cats) == 0, f"unrecognised categories: {bad_cats}")
 
 
 # ============================================================
@@ -488,6 +529,66 @@ all_past_available = all(
     mask[i][j] for i in range(5) for j in range(0, i+1)
 )
 check("7d. all past positions are always available", all_past_available)
+
+
+# ============================================================
+# SECTION 8 — Real dataset line-pair parsing (no network required)
+# ============================================================
+section("8. Real dataset text format parsing")
+
+# Replicate _parse_category_text from dataset.py against a fixture that
+# is a byte-for-byte copy of real lines pulled from the actual
+# mathematics_dataset-v1.0.tar.gz (train-easy/arithmetic__add_or_sub.txt
+# and train-easy/arithmetic__div.txt), verified by direct download.
+REAL_FIXTURE = (
+    "What is -5 - 110911?\n"
+    "-110916\n"
+    "What is -0.188 + -0.814?\n"
+    "-1.002\n"
+    "Sum 259 and -46.\n"
+    "213\n"
+    "What is -280 divided by -10?\n"
+    "28\n"
+    "Calculate -4 divided by 3.\n"
+    "-4/3\n"
+)
+
+def parse_category_text(raw_text, member_name="fixture"):
+    lines = raw_text.strip("\n").split("\n")
+    if len(lines) % 2 != 0:
+        raise ValueError(f"odd number of lines in {member_name}")
+    pairs = []
+    for i in range(0, len(lines), 2):
+        q, a = lines[i].strip(), lines[i+1].strip()
+        if q and a:
+            pairs.append((q, a))
+    return pairs
+
+parsed = parse_category_text(REAL_FIXTURE)
+check("8a. parses correct number of Q/A pairs from real-format fixture",
+      len(parsed) == 5, f"got {len(parsed)}")
+check("8b. first pair matches expected real question/answer",
+      parsed[0] == ("What is -5 - 110911?", "-110916"), f"got {parsed[0]}")
+check("8c. handles fractional answers (e.g. division) without truncation",
+      parsed[4] == ("Calculate -4 divided by 3.", "-4/3"), f"got {parsed[4]}")
+
+# 8d. Odd line count must raise, not silently drop the last question
+try:
+    parse_category_text("Question only, no answer\n")
+    odd_raised = False
+except ValueError:
+    odd_raised = True
+check("8d. malformed (odd-line) file raises instead of silently truncating",
+      odd_raised)
+
+# 8e. format_example + tokenizer round-trip on a REAL fraction-valued answer
+tok_real = MathTokenizer()
+real_item = {"question": "Calculate -4 divided by 3.", "answer": "-4/3"}
+tok_real.build([format_example(real_item)])
+ids_real = tok_real.encode(format_example(real_item))
+back_real = tok_real.decode(ids_real)
+check("8e. real fraction-valued example round-trips through the tokenizer",
+      back_real == format_example(real_item), f"got {back_real!r}")
 
 
 # ============================================================

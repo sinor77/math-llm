@@ -308,14 +308,13 @@ def interactive_demo(
     Run an interactive loop: user types a math question, model answers.
     Type 'quit' or press Ctrl-C to exit.
     """
-    print("\n" + "=" * 60)
-    print("Math LLM Interactive Demo")
-    print("Type a math question and press Enter.  'quit' to exit.")
-    print("=" * 60)
+    print("\nSmall Math LLM")
+    print("Type a mathematical question.")
+    print("Type 'exit' to quit.\n")
 
     while True:
         try:
-            question = input("\nQuestion: ").strip()
+            question = input("Question: ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\nGoodbye!")
             break
@@ -326,13 +325,16 @@ def interactive_demo(
         if not question:
             continue
 
-        answer, full = generate_answer(
+        # The displayed answer comes straight from the model's own
+        # generated tokens (extract_answer just slices <A>...<EOS> out of
+        # what the model produced) — no calculator, no external API, no
+        # hard-coded lookup is involved anywhere in this path.
+        answer, _full = generate_answer(
             model, tokenizer, question, device,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
         )
-        print(f"Answer  : {answer}")
-        print(f"Full gen: {full}")
+        print(f"\nModel: {answer}\n")
 
 
 # ---------------------------------------------------------------------------

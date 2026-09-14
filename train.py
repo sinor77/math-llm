@@ -55,7 +55,7 @@ from torch.utils.data import DataLoader
 # ── project imports ──────────────────────────────────────────────────────────
 from config import ModelConfig, TrainConfig, DataConfig, get_model_config, get_train_config
 from tokenizer import MathTokenizer
-from dataset import build_dataloaders
+from dataset import build_dataloaders, RealDatasetLoadError
 from model import MathLLM
 from utils import (
     get_logger, set_seed, get_device, cosine_lr_with_warmup,
@@ -96,13 +96,19 @@ def train(
 
     # ── Data ────────────────────────────────────────────────────────────────
     log.info("Building data loaders …")
-    train_loader, val_loader, test_loader, tokenizer = build_dataloaders(
+    train_loader, val_loader, test_loader, tokenizer, source_info = build_dataloaders(
         data_cfg, model_cfg, batch_size=train_cfg.batch_size
     )
 
-    # Save tokenizer right away so it's available for generation/eval
-    os.makedirs("checkpoints", exist_ok=True)
-    tok_path = os.path.join("checkpoints", "tokenizer.json")
+    # Save tokenizer right away so it's available for generation/eval.
+    # IMPORTANT: this must live inside train_cfg.checkpoint_dir, not a
+    # hardcoded "checkpoints/" — otherwise every run (e.g. each experiment
+    # in experiments.py, which gives each a distinct checkpoint_dir) would
+    # overwrite the SAME shared tokenizer file, silently corrupting the
+    # tokenizer_path recorded in earlier checkpoints (they'd still "load"
+    # successfully but decode with the wrong, later vocab mapping).
+    os.makedirs(train_cfg.checkpoint_dir, exist_ok=True)
+    tok_path = os.path.join(train_cfg.checkpoint_dir, "tokenizer.json")
     tokenizer.save(tok_path)
 
     # ── Model ───────────────────────────────────────────────────────────────
@@ -290,7 +296,7 @@ def train(
                         log.info("  Early stopping triggered.")
                         _save_final_and_history(
                             model, optimizer, step, best_val_loss,
-                            model_cfg, train_cfg, tok_path, history,
+                            model_cfg, train_cfg, tok_path, history, source_info,
                         )
                         return history
 
@@ -306,6 +312,7 @@ def train(
                     checkpoint_dir=train_cfg.checkpoint_dir,
                     keep_last_n=train_cfg.keep_last_n,
                     is_best=is_best,
+                    data_source_info=source_info,
                 )
 
             step += 1
@@ -314,7 +321,7 @@ def train(
     log.info(f"Training complete. Best val loss: {best_val_loss:.4f}")
     _save_final_and_history(
         model, optimizer, step, best_val_loss,
-        model_cfg, train_cfg, tok_path, history,
+        model_cfg, train_cfg, tok_path, history, source_info,
     )
     return history
 
@@ -325,7 +332,7 @@ def train(
 
 def _save_final_and_history(
     model, optimizer, step, best_val_loss,
-    model_cfg, train_cfg, tok_path, history,
+    model_cfg, train_cfg, tok_path, history, source_info=None,
 ):
     """Save final_model.pt and training_history.json."""
     os.makedirs(train_cfg.checkpoint_dir, exist_ok=True)
@@ -339,6 +346,7 @@ def _save_final_and_history(
         "cfg_model":   model_cfg.__dict__,
         "cfg_train":   train_cfg.__dict__,
         "tokenizer_path": tok_path,
+        "data_source_info": source_info or {},
     }, final_path)
     log.info(f"Final model saved → {final_path}")
 
@@ -445,7 +453,18 @@ if __name__ == "__main__":
     log.info(f"Stage   : {args.stage}")
     log.info(f"Cats    : {data_cfg.active_categories}")
 
-    history = train(model_cfg, train_cfg, data_cfg, resume_from=args.resume)
+    try:
+        history = train(model_cfg, train_cfg, data_cfg, resume_from=args.resume)
+    except RealDatasetLoadError as exc:
+        # NEVER fall back to synthetic data — stop the run and surface the
+        # real underlying failure so it can be diagnosed and fixed.
+        print("\n" + "!" * 60)
+        print("REAL DATASET LOAD FAILED")
+        print("Reason:")
+        print(str(exc))
+        print("!" * 60)
+        raise SystemExit(1)
+
     plot_training_curve(history)
 
     log.info("Done.")
