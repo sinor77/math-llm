@@ -725,22 +725,61 @@ from one shared pool), and `check_split_overlap()` still verifies zero
 overlap on top of that rather than just assuming independence guarantees it.
 
 ```bash
-python train.py --model small-2M --curriculum digits_1_4 \
-    --dataset-source generated --min-digits 1 --max-digits 4
+python train.py --model small-2M --curriculum digits_1_4_long \
+    --dataset-source generated --ops "+,-,*" --reverse-answer --patience 15
 ```
 
-`digits_1_4` ramps the operand digit cap 2 → 3 → 4 (cumulative — each
-stage adds harder examples on top of, not instead of, the easier ones),
-matching `--max-digits 4`. `evaluate.py`/`generate.py` automatically read
-which dataset a checkpoint was trained on from its saved `data_source_info`
-— you don't need to re-specify `--dataset-source` at eval time.
+`digits_1_4_long` ramps the operand digit cap 1 → 2 → 3 → 4 (cumulative —
+each stage adds harder examples on top of, not instead of, the easier
+ones), spending most of its 80K-step budget on the final, full-range
+stage. `evaluate.py`/`generate.py` automatically read which dataset a
+checkpoint was trained on (including `--reverse-answer`) from its saved
+`data_source_info` — you don't need to re-specify these flags at eval time.
+
+### Reversed-digit answers (`--reverse-answer`)
+
+A real measured run without this flag (small-2M, `digits_1_4_long`,
+`+,-,*` only) got 86.6%/89.8% exact-answer accuracy on addition/subtraction
+— strong, but the failures were almost all the same pattern:
+
+```
+9286 + 3247 = 12533   predicted: 2533    (dropped the leading "1")
+6556 + 5749 = 12305   predicted: 2305    (same pattern)
+1438 + 8898 = 10336   predicted: 0336    (same pattern)
+```
+
+Every failure is a case where carrying produces a result **one digit
+longer than both operands** (4-digit + 4-digit → 5-digit). Generating the
+answer most-significant-digit-first forces the model to commit to the
+answer's length before it has seen the full carry chain — so it
+systematically failed exactly there.
+
+`--reverse-answer` writes the answer's digits least-significant-first in
+the *training text only* (`10366` → `"66301"`); `generate.generate_answer()`
+reverses it back automatically everywhere it's used, so `item["answer"]`,
+what you see in the notebook, in `evaluate.py`'s output, and in
+`generate.py --interactive` is always normal reading order — only the
+model's internal training/generation target is affected. This lets "does
+this carry need one more digit" be decided naturally at the *end* of
+generation instead of the *start*. The same technique (there, as part of
+full chain-of-thought reasoning) is used by
+[brendanlong/math-llm](https://github.com/brendanlong/math-llm) for
+exactly this reason, which independently corroborates it.
 
 **Potential improvements:**
 
 - Sub-word tokenization (better number handling)
-- Reversed-digit answer representation (a well-known trick for char-level
-  arithmetic: generating the least-significant digit first lets carries
-  propagate in the same left-to-right order the model already generates in)
+- Full chain-of-thought reasoning traces (not just a reversed final
+  answer) — see brendanlong/math-llm for a working implementation of this
+  on a different, more research-oriented architecture stack
+- RL fine-tuning with a verifiable reward (exact-match) on top of a
+  strong supervised base — investigated using HuggingFace TRL, but its
+  `GRPOTrainer`/`PPOTrainer` require a `transformers.PreTrainedModel`
+  (confirmed by reading `trl/trainer/grpo_trainer.py`), not an arbitrary
+  `nn.Module`, so adopting it would mean reimplementing this model on top
+  of the `transformers` stack. A small hand-written REINFORCE-style loop
+  would fit this project's from-scratch philosophy better if this is
+  pursued later.
 - Chain-of-thought training (intermediate steps)
 - Data augmentation (more number combinations)
 - Larger model with more training compute

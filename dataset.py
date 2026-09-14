@@ -621,6 +621,7 @@ def generate_controlled_dataset(
             "ops": ops,
             "min_digits": min_d,
             "max_digits": max_d,
+            "reverse_answer": cfg.generated_reverse_answer,
         },
         "train_examples": len(train_items),
         "val_examples": len(val_items),
@@ -631,7 +632,15 @@ def generate_controlled_dataset(
     print("\n" + "=" * 60)
     print("Data source: GENERATED (controlled Python arithmetic, not the real dataset)")
     print(f"Dataset      : {source_info['dataset']}")
-    print(f"Configuration: ops={ops}  digits=[{min_d},{max_d}]")
+    print(f"Configuration: ops={ops}  digits=[{min_d},{max_d}]  "
+          f"reverse_answer={cfg.generated_reverse_answer}")
+    if cfg.generated_reverse_answer:
+        print("  NOTE: answers are written LEAST-SIGNIFICANT-DIGIT-FIRST in "
+              "the training text (e.g. 10366 -> '66301'). item['answer'] "
+              "itself and everything printed below stays in normal reading "
+              "order — this only affects what the model is trained to "
+              "generate internally; generate.generate_answer() reverses it "
+              "back automatically.")
     print(f"Train examples     : {len(train_items)}")
     print(f"Validation examples: {len(val_items)}")
     print(f"Test examples      : {len(test_items)}  (independently generated, disjoint by construction)")
@@ -649,6 +658,7 @@ def format_example(
     q_token: str = "<Q>",
     a_token: str = "<A>",
     eos_token: str = "<EOS>",
+    reverse_answer: bool = False,
 ) -> str:
     """
     Format a raw example dict into the string the model is trained on.
@@ -656,8 +666,23 @@ def format_example(
     Example:
         {"question": "What is 3+4?", "answer": "7"}
         →  "<Q>What is 3+4?<A>7<EOS>"
+
+    reverse_answer : if True, write the answer's characters in reverse
+        order in the TOKEN STREAM ONLY (item['answer'] itself is never
+        mutated — this is purely how the training text is built).
+        Motivated by a real, diagnosed failure: a model generating the
+        answer most-significant-digit-first has to commit to the answer's
+        length before it has seen the full carry chain, and was observed
+        systematically dropping the leading digit whenever carrying
+        produced a result one digit longer than both operands (e.g.
+        9286+3247=12533 predicted as 2533). Writing the least-significant
+        digit first lets that decision happen naturally at the END of
+        generation instead. generate.generate_answer() reverses the
+        extracted text back to normal reading order before returning it,
+        so every caller still sees/compares natural-order answers.
     """
-    return f"{q_token}{item['question']}{a_token}{item['answer']}{eos_token}"
+    answer = item["answer"][::-1] if reverse_answer else item["answer"]
+    return f"{q_token}{item['question']}{a_token}{answer}{eos_token}"
 
 
 # ---------------------------------------------------------------------------
@@ -690,17 +715,19 @@ class MathDataset(Dataset):
         tokenizer: MathTokenizer,
         max_seq_len: int = 256,
         mask_question: bool = True,
+        reverse_answer: bool = False,
     ):
         self.tokenizer    = tokenizer
         self.max_seq_len  = max_seq_len
         self.mask_question = mask_question
+        self.reverse_answer = reverse_answer
         self.examples: List[Dict] = []
 
         a_id = tokenizer.token_to_id.get("<A>", None)
 
         skipped = 0
         for item in items:
-            text = format_example(item)
+            text = format_example(item, reverse_answer=reverse_answer)
             ids  = tokenizer.encode(text, add_eos=False, max_length=max_seq_len)
 
             if len(ids) < 4:            # too short to be useful
@@ -858,6 +885,7 @@ def build_dataloaders_from_items(
     cfg_model:   ModelConfig,
     tokenizer:   Optional[MathTokenizer] = None,
     batch_size:  int = 64,
+    reverse_answer: bool = False,
 ) -> Tuple[DataLoader, DataLoader, DataLoader, MathTokenizer]:
     """
     Build tokenizer + PyTorch DataLoaders from already-loaded item lists.
@@ -866,14 +894,22 @@ def build_dataloaders_from_items(
     train/val/test items (e.g. the Colab notebook, which prints and
     verifies the real data before building loaders) don't need to
     re-download/re-extract the dataset a second time.
+
+    reverse_answer : see format_example() — writes answer digits
+        least-significant-first in the TRAINING TEXT only.
     """
     # Build or reuse tokenizer — built on ALL data (train+val+test) so no
     # split's characters are unseen by the tokenizer. The tokenizer only
     # stores character→id mappings; it carries no information about which
     # split an example belongs to, so this does not leak labels/answers.
+    # (Reversal doesn't change the character SET, only digit order within
+    # an answer, so it can't introduce/remove vocabulary either way — built
+    # with reverse_answer applied anyway so the built text is exactly what
+    # training will actually see.)
     if tokenizer is None:
         tokenizer = MathTokenizer()
-        all_texts = [format_example(item) for item in (train_items + val_items + test_items)]
+        all_texts = [format_example(item, reverse_answer=reverse_answer)
+                     for item in (train_items + val_items + test_items)]
         tokenizer.build(all_texts)
 
     # Update vocab size in model config
@@ -881,9 +917,9 @@ def build_dataloaders_from_items(
 
     # PyTorch Datasets
     max_len = cfg_model.max_seq_len
-    train_ds = MathDataset(train_items, tokenizer, max_seq_len=max_len)
-    val_ds   = MathDataset(val_items,   tokenizer, max_seq_len=max_len)
-    test_ds  = MathDataset(test_items,  tokenizer, max_seq_len=max_len)
+    train_ds = MathDataset(train_items, tokenizer, max_seq_len=max_len, reverse_answer=reverse_answer)
+    val_ds   = MathDataset(val_items,   tokenizer, max_seq_len=max_len, reverse_answer=reverse_answer)
+    test_ds  = MathDataset(test_items,  tokenizer, max_seq_len=max_len, reverse_answer=reverse_answer)
 
     print(f"[Dataset] Sizes after tokenisation: "
           f"train={len(train_ds)}  val={len(val_ds)}  test={len(test_ds)}")
@@ -925,9 +961,11 @@ def build_dataloaders(
     train_loader, val_loader, test_loader, tokenizer, source_info
     """
     train_items, val_items, test_items, source_info = load_split_dataset(cfg_data)
+    reverse_answer = (cfg_data.dataset_source == "generated"
+                       and cfg_data.generated_reverse_answer)
     train_loader, val_loader, test_loader, tokenizer = build_dataloaders_from_items(
         train_items, val_items, test_items, cfg_model,
-        tokenizer=tokenizer, batch_size=batch_size,
+        tokenizer=tokenizer, batch_size=batch_size, reverse_answer=reverse_answer,
     )
     return train_loader, val_loader, test_loader, tokenizer, source_info
 

@@ -301,6 +301,20 @@ class DataConfig:
     # overlap on top of that.
     generated_train_seed: int = 42
     generated_test_seed: int = 20242
+    # Reverse the ANSWER's digits in the training/generation token stream
+    # (e.g. ground truth 10366 is written to the model as "66301") —
+    # purely a training-format choice, never stored in item["answer"] or
+    # shown to a user; dataset.format_example()/generate.generate_answer()
+    # apply and undo it respectively. Motivated by a real, specific
+    # observed failure: an addition model at 86.6% accuracy on 1-4 digit
+    # add/sub systematically dropped the leading digit exactly when
+    # carrying produced a result one digit longer than both operands
+    # (e.g. 9286+3247=12533 -> predicted 2533) — generating
+    # most-significant-digit-first forces the model to commit to the
+    # answer's length before it has seen the full carry chain. Reversing
+    # so the least-significant digit comes first lets "does this carry
+    # need one more digit" be decided naturally at the END of generation.
+    generated_reverse_answer: bool = False
 
 
 # ---------------------------------------------------------------------------

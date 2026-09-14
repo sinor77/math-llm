@@ -109,13 +109,22 @@ def train(
     log.info("Loading real dataset …")
     train_items, val_items, test_items, source_info = load_split_dataset(data_cfg)
 
+    # Reverse the answer's digits in the TRAINING TEXT only (ground truth
+    # in train_items/val_items/test_items stays natural-order) — see
+    # dataset.format_example() for why. Only meaningful for the generated
+    # benchmark (real-dataset answers can be decimals/negatives, out of
+    # scope for this fix).
+    reverse_answer = (data_cfg.dataset_source == "generated"
+                       and data_cfg.generated_reverse_answer)
+
     # Tokenizer is built once on the FULL, unfiltered pool (train+val+test)
     # so the vocabulary is complete regardless of which curriculum stage is
     # active — number-length filtering only changes which examples are
     # used, never which characters can appear (digits/operators are the
     # same whether a number is short or long).
     tokenizer = MathTokenizer()
-    all_texts = [format_example(it) for it in (train_items + val_items + test_items)]
+    all_texts = [format_example(it, reverse_answer=reverse_answer)
+                 for it in (train_items + val_items + test_items)]
     tokenizer.build(all_texts)
     model_cfg.vocab_size = tokenizer.vocab_size
 
@@ -238,7 +247,8 @@ def train(
         return total_loss / n_batches, total_acc / n_batches
 
     def _make_loader(items, shuffle: bool) -> DataLoader:
-        ds = MathDataset(items, tokenizer, max_seq_len=model_cfg.max_seq_len)
+        ds = MathDataset(items, tokenizer, max_seq_len=model_cfg.max_seq_len,
+                          reverse_answer=reverse_answer)
         _collate = partial(collate_fn, pad_id=tokenizer.pad_id)
         return DataLoader(
             ds, batch_size=train_cfg.batch_size if shuffle else 128,
@@ -528,6 +538,21 @@ def parse_args():
                         "first clean pass (division adds exact-integer "
                         "constraint solving on top of carrying — worth "
                         "isolating). Default: all of +,-,*,/.")
+    p.add_argument("--reverse-answer", action="store_true",
+                   help="Generated benchmark only: write the answer's "
+                        "digits least-significant-first in the training "
+                        "text (e.g. 10366 -> '66301'; un-reversed "
+                        "automatically at generation/eval time). Fixes a "
+                        "diagnosed failure mode: generating most-"
+                        "significant-digit-first forces committing to the "
+                        "answer's length before the full carry chain is "
+                        "known, and was observed dropping the leading "
+                        "digit whenever carrying added one beyond both "
+                        "operands' length (e.g. 9286+3247=12533 predicted "
+                        "as 2533). Independently validated by "
+                        "github.com/brendanlong/math-llm's chain-of-"
+                        "thought approach, which reverses digits for the "
+                        "same reason.")
     p.add_argument("--patience", type=int, default=None,
                    help="Override early-stopping patience (evals with no "
                         "val-loss improvement before stopping A STAGE, not "
@@ -560,13 +585,14 @@ if __name__ == "__main__":
     if args.dataset_source == "generated":
         data_cfg.generated_min_digits = args.min_digits
         data_cfg.generated_max_digits = args.max_digits
+        data_cfg.generated_reverse_answer = args.reverse_answer
         if args.ops:
             data_cfg.generated_ops = [op.strip() for op in args.ops.split(",")]
         log.info(f"=== Math LLM Training ===")
         log.info(f"Model   : {args.model}")
         log.info(f"Preset  : {args.train}")
         log.info(f"Source  : generated  (digits {args.min_digits}-{args.max_digits}, "
-                 f"ops={data_cfg.generated_ops})")
+                 f"ops={data_cfg.generated_ops}, reverse_answer={args.reverse_answer})")
     else:
         # Select data stage (real dataset only)
         if args.stage == "1":

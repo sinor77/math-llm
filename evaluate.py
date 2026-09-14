@@ -125,6 +125,7 @@ def evaluate_exact_answer(
     beam_size:      int = 1,            # 1 = greedy; >1 = beam search
     temperature:    float = 0.0,        # 0 = greedy
     show_n:         int = 5,            # number of examples to print
+    reverse_answer: bool = False,       # see generate.generate_answer()
 ) -> Dict:
     """
     Autoregressive exact-answer evaluation.
@@ -169,6 +170,7 @@ def evaluate_exact_answer(
             device=device,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
+            reverse_answer=reverse_answer,
         )
         pred_ans = pred_ans.strip()
 
@@ -187,7 +189,7 @@ def evaluate_exact_answer(
             per_category[category]["correct"] += 1
 
         # ── Full-sequence match ───────────────────────────────────────────
-        gold_full = format_example(item)
+        gold_full = format_example(item, reverse_answer=reverse_answer)
         full_match = (full_gen.strip() == gold_full.strip())
         total_fullseq += 1
         if full_match:
@@ -265,6 +267,7 @@ def _reconstruct_data_cfg_from_checkpoint(raw: Dict) -> DataConfig:
         cfg.generated_ops = config.get("ops", cfg.generated_ops)
         cfg.generated_min_digits = config.get("min_digits", cfg.generated_min_digits)
         cfg.generated_max_digits = config.get("max_digits", cfg.generated_max_digits)
+        cfg.generated_reverse_answer = config.get("reverse_answer", cfg.generated_reverse_answer)
     elif source == "REAL":
         cfg.dataset_source = "real"
         cfg.active_categories = config.get("active_categories", cfg.active_categories)
@@ -332,11 +335,18 @@ def full_evaluation(
 
     _, _, test_items, source_info = load_split_dataset(data_cfg)
 
+    reverse_answer = (data_cfg.dataset_source == "generated"
+                       and data_cfg.generated_reverse_answer)
+    if reverse_answer:
+        log.info("Dataset trained with reverse_answer=True — un-reversing "
+                 "generated answers for scoring/display.")
+
     log.info(f"Test set size: {len(test_items)}")
 
     # ── Token accuracy (fast) ──────────────────────────────────────────────
     log.info("--- Token-level accuracy (teacher-forced) ---")
-    test_ds = MathDataset(test_items, tokenizer, max_seq_len=model_cfg.max_seq_len)
+    test_ds = MathDataset(test_items, tokenizer, max_seq_len=model_cfg.max_seq_len,
+                           reverse_answer=reverse_answer)
     _collate = partial(collate_fn, pad_id=tokenizer.pad_id)
     test_loader = DataLoader(test_ds, batch_size=128, shuffle=False,
                               num_workers=0, collate_fn=_collate)
@@ -352,6 +362,7 @@ def full_evaluation(
         items=test_items,
         device=device,
         max_new_tokens=max_new_tokens,
+        reverse_answer=reverse_answer,
     )
 
     # ── Print results ──────────────────────────────────────────────────────
