@@ -15,7 +15,7 @@ Three data-classes are defined:
 """
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +114,24 @@ class TrainConfig:
 
     # ---- Mixed precision (AMP) --------------------------------------------
     use_amp: bool = True          # torch.cuda.amp automatic mixed precision
+
+    # ---- Curriculum (easy -> hard by number length) ------------------------
+    # A character-level model has no built-in notion of place value — it
+    # has to learn digit-by-digit carrying purely from examples. That is
+    # much easier to learn from short numbers first. If set, training runs
+    # through these stages in order, each restricting the REAL training
+    # pool to examples whose numbers fit within that stage's digit limits
+    # (see dataset.filter_by_number_length), before lifting the
+    # restriction. None (default) disables curriculum: train on the full,
+    # unfiltered pool for `max_steps` steps, as before.
+    #
+    # Each stage dict: {"max_int_digits": int|None,
+    #                    "max_decimal_digits": int|None,
+    #                    "steps": int}
+    # The LR schedule's cosine decay spans the SUM of all stage step counts
+    # (not the flat `max_steps` above) so it decays smoothly across the
+    # whole curriculum rather than restarting each stage.
+    curriculum: Optional[List[Dict]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +317,42 @@ def get_model_config(name: str = "small-2M") -> ModelConfig:
         raise ValueError(f"Unknown model preset '{name}'. "
                          f"Choose from: {list(configs.keys())}")
     return configs[name]
+
+
+def get_curriculum(name: str = "none") -> Optional[List[Dict]]:
+    """
+    Return a named curriculum preset (see TrainConfig.curriculum).
+
+    Stage thresholds below are calibrated against the REAL train-easy data
+    for Stage-1 categories (verified by directly counting max digit-length
+    per example: arithmetic__add_or_sub, arithmetic__mul both have
+    thousands of examples with <=2 integer digits and <=1 decimal digit;
+    arithmetic__div/arithmetic__mixed produce whole-number or fraction
+    answers with 0 decimal digits, so the decimal bound never restricts
+    them). Every stage has ample real examples — none of this is guessed.
+    """
+    presets: Dict[str, Optional[List[Dict]]] = {
+        "none": None,
+        "default": [
+            {"max_int_digits": 2, "max_decimal_digits": 1, "steps": 6_000},
+            {"max_int_digits": 4, "max_decimal_digits": 3, "steps": 7_000},
+            {"max_int_digits": None, "max_decimal_digits": None, "steps": 7_000},
+        ],
+        "fast": [
+            {"max_int_digits": 2, "max_decimal_digits": 1, "steps": 1_500},
+            {"max_int_digits": 4, "max_decimal_digits": 3, "steps": 1_500},
+            {"max_int_digits": None, "max_decimal_digits": None, "steps": 2_000},
+        ],
+        "thorough": [
+            {"max_int_digits": 2, "max_decimal_digits": 1, "steps": 10_000},
+            {"max_int_digits": 4, "max_decimal_digits": 3, "steps": 15_000},
+            {"max_int_digits": None, "max_decimal_digits": None, "steps": 25_000},
+        ],
+    }
+    if name not in presets:
+        raise ValueError(f"Unknown curriculum preset '{name}'. "
+                         f"Choose from: {list(presets.keys())}")
+    return presets[name]
 
 
 def get_train_config(preset: str = "default") -> TrainConfig:

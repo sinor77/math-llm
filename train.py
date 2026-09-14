@@ -53,9 +53,17 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 # ── project imports ──────────────────────────────────────────────────────────
-from config import ModelConfig, TrainConfig, DataConfig, get_model_config, get_train_config
+from functools import partial
+
+from torch.utils.data import DataLoader
+
+from config import ModelConfig, TrainConfig, DataConfig, get_model_config, get_train_config, get_curriculum
 from tokenizer import MathTokenizer
-from dataset import build_dataloaders, RealDatasetLoadError
+from dataset import (
+    RealDatasetLoadError,
+    load_split_dataset, format_example, filter_by_number_length,
+    MathDataset, collate_fn,
+)
 from model import MathLLM
 from utils import (
     get_logger, set_seed, get_device, cosine_lr_with_warmup,
@@ -95,10 +103,21 @@ def train(
     device = get_device(train_cfg.device)
 
     # ── Data ────────────────────────────────────────────────────────────────
-    log.info("Building data loaders …")
-    train_loader, val_loader, test_loader, tokenizer, source_info = build_dataloaders(
-        data_cfg, model_cfg, batch_size=train_cfg.batch_size
-    )
+    # Loaded once as raw item lists (not DataLoaders yet) so a curriculum
+    # can re-filter train/val by number length between stages without
+    # re-downloading/re-extracting the real dataset.
+    log.info("Loading real dataset …")
+    train_items, val_items, test_items, source_info = load_split_dataset(data_cfg)
+
+    # Tokenizer is built once on the FULL, unfiltered pool (train+val+test)
+    # so the vocabulary is complete regardless of which curriculum stage is
+    # active — number-length filtering only changes which examples are
+    # used, never which characters can appear (digits/operators are the
+    # same whether a number is short or long).
+    tokenizer = MathTokenizer()
+    all_texts = [format_example(it) for it in (train_items + val_items + test_items)]
+    tokenizer.build(all_texts)
+    model_cfg.vocab_size = tokenizer.vocab_size
 
     # Save tokenizer right away so it's available for generation/eval.
     # IMPORTANT: this must live inside train_cfg.checkpoint_dir, not a
@@ -167,12 +186,28 @@ def train(
     # Compute min LR for the schedule
     min_lr = train_cfg.learning_rate * train_cfg.min_lr_ratio
 
+    # ── Curriculum stages ────────────────────────────────────────────────────
+    # Without a curriculum, this is a single "stage" spanning the whole
+    # unfiltered pool for train_cfg.max_steps — identical to the old
+    # behaviour. With one, we train through progressively less-restricted
+    # slices of the REAL data (see dataset.filter_by_number_length), never
+    # synthetic/altered examples — just a different subset at each stage.
+    if train_cfg.curriculum:
+        stages = train_cfg.curriculum
+    else:
+        stages = [{"max_int_digits": None, "max_decimal_digits": None,
+                   "steps": train_cfg.max_steps}]
+    total_steps = sum(s["steps"] for s in stages)
+
     # ── Helper: set learning rate for this step ──────────────────────────────
+    # The cosine decay spans total_steps (the FULL curriculum), not any one
+    # stage's step count, so LR decays smoothly across stage transitions
+    # instead of restarting.
     def update_lr(step: int) -> float:
         lr = cosine_lr_with_warmup(
             step,
             warmup_steps=train_cfg.warmup_steps,
-            max_steps=train_cfg.max_steps,
+            max_steps=total_steps,
             max_lr=train_cfg.learning_rate,
             min_lr=min_lr,
         )
@@ -180,14 +215,15 @@ def train(
             group["lr"] = lr
         return lr
 
-    # ── Helper: run validation ───────────────────────────────────────────────
-    def run_validation() -> Tuple[float, float]:
+    # ── Helper: run validation against whichever val_loader is currently
+    #    active (reassigned per curriculum stage below) ──────────────────────
+    def run_validation(loader: DataLoader) -> Tuple[float, float]:
         model.eval()
         total_loss = 0.0
         total_acc  = 0.0
         n_batches  = 0
         with torch.no_grad():
-            for batch in val_loader:
+            for batch in loader:
                 ids    = batch["input_ids"].to(device)
                 labels = batch["labels"].to(device)
                 with torch.cuda.amp.autocast(enabled=use_amp):
@@ -201,8 +237,17 @@ def train(
             return float("inf"), 0.0
         return total_loss / n_batches, total_acc / n_batches
 
+    def _make_loader(items, shuffle: bool) -> DataLoader:
+        ds = MathDataset(items, tokenizer, max_seq_len=model_cfg.max_seq_len)
+        _collate = partial(collate_fn, pad_id=tokenizer.pad_id)
+        return DataLoader(
+            ds, batch_size=train_cfg.batch_size if shuffle else 128,
+            shuffle=shuffle, num_workers=0, collate_fn=_collate, pin_memory=True,
+        )
+
     # ── Training loop ────────────────────────────────────────────────────────
-    log.info(f"Starting training: {train_cfg.max_steps} total steps")
+    log.info(f"Starting training: {total_steps} total steps"
+             f"{' across ' + str(len(stages)) + ' curriculum stages' if train_cfg.curriculum else ''}")
     log.info(f"  Batch size    : {train_cfg.batch_size}")
     log.info(f"  Peak LR       : {train_cfg.learning_rate}")
     log.info(f"  Warmup steps  : {train_cfg.warmup_steps}")
@@ -215,110 +260,149 @@ def train(
     running_acc  = 0.0
     running_n    = 0
 
-    while step < train_cfg.max_steps:
-        epoch += 1
-        for batch in train_loader:
-            if step >= train_cfg.max_steps:
-                break
+    cumulative_steps = 0
+    for stage_idx, stage in enumerate(stages):
+        stage_start_step = cumulative_steps
+        cumulative_steps += stage["steps"]
+        stage_end_step = cumulative_steps
 
-            # ── Move data to device ─────────────────────────────────────
-            ids    = batch["input_ids"].to(device, non_blocking=True)
-            labels = batch["labels"].to(device, non_blocking=True)
+        if step >= stage_end_step:
+            continue   # already completed this stage in a previous (resumed) run
 
-            # ── Update learning rate ────────────────────────────────────
-            current_lr = update_lr(step)
+        max_int_d = stage.get("max_int_digits")
+        max_dec_d = stage.get("max_decimal_digits")
+        stage_train_items = filter_by_number_length(train_items, max_int_d, max_dec_d)
+        stage_val_items   = filter_by_number_length(val_items,   max_int_d, max_dec_d)
 
-            # ── Forward pass ────────────────────────────────────────────
-            optimizer.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=use_amp):
-                out  = model(ids, labels=labels)
-                loss = out["loss"]
+        if not stage_train_items:
+            raise RuntimeError(
+                f"Curriculum stage {stage_idx + 1}/{len(stages)} "
+                f"(max_int_digits={max_int_d}, max_decimal_digits={max_dec_d}) "
+                f"matched ZERO real training examples. Loosen the stage's "
+                f"limits or check DataConfig.active_categories."
+            )
 
-            if loss is None or torch.isnan(loss):
-                log.warning(f"Step {step}: loss is None or NaN — skipping batch")
+        if train_cfg.curriculum:
+            log.info(
+                f"[Curriculum] Stage {stage_idx + 1}/{len(stages)}: "
+                f"max_int_digits={max_int_d}  max_decimal_digits={max_dec_d}  "
+                f"train={len(stage_train_items)}  val={len(stage_val_items)}  "
+                f"steps={stage['steps']} (global {stage_start_step}→{stage_end_step})"
+            )
+
+        train_loader = _make_loader(stage_train_items, shuffle=True)
+        val_loader   = _make_loader(stage_val_items,   shuffle=False)
+
+        # Best-val-loss/patience are tracked PER STAGE: a harder stage's
+        # intrinsically higher loss is not a regression against an easier
+        # stage's best, and comparing them would trigger spurious early
+        # stopping right at every stage transition.
+        best_val_loss    = float("inf")
+        patience_counter = 0
+
+        while step < stage_end_step:
+            epoch += 1
+            for batch in train_loader:
+                if step >= stage_end_step:
+                    break
+
+                # ── Move data to device ─────────────────────────────────
+                ids    = batch["input_ids"].to(device, non_blocking=True)
+                labels = batch["labels"].to(device, non_blocking=True)
+
+                # ── Update learning rate ────────────────────────────────
+                current_lr = update_lr(step)
+
+                # ── Forward pass ────────────────────────────────────────
+                optimizer.zero_grad(set_to_none=True)
+                with torch.cuda.amp.autocast(enabled=use_amp):
+                    out  = model(ids, labels=labels)
+                    loss = out["loss"]
+
+                if loss is None or torch.isnan(loss):
+                    log.warning(f"Step {step}: loss is None or NaN — skipping batch")
+                    step += 1
+                    continue
+
+                # ── Backward pass ────────────────────────────────────────
+                scaler.scale(loss).backward()
+
+                # Gradient clipping prevents parameter updates that are too large.
+                # We unscale first so the clip threshold is in the correct units.
+                scaler.unscale_(optimizer)
+                nn.utils.clip_grad_norm_(model.parameters(), train_cfg.grad_clip)
+
+                scaler.step(optimizer)
+                scaler.update()
+
+                # ── Accumulate running stats ─────────────────────────────
+                running_loss += loss.item()
+                running_acc  += token_accuracy(out["logits"].detach(), labels)
+                running_n    += 1
+
+                # ── Periodic logging ─────────────────────────────────────
+                if step % train_cfg.log_every_steps == 0 and running_n > 0:
+                    avg_loss = running_loss / running_n
+                    avg_acc  = running_acc  / running_n
+                    elapsed  = time.time() - t_start
+                    steps_remaining = total_steps - step
+                    eta = elapsed / max(step - start_step, 1) * steps_remaining
+                    log.info(
+                        f"Step {step:6d}/{total_steps}  "
+                        f"loss={avg_loss:.4f}  tok_acc={avg_acc:.3f}  "
+                        f"lr={current_lr:.2e}  "
+                        f"elapsed={format_duration(elapsed)}  "
+                        f"ETA={format_duration(eta)}"
+                    )
+                    running_loss = 0.0
+                    running_acc  = 0.0
+                    running_n    = 0
+
+                # ── Periodic validation ───────────────────────────────────
+                if step % train_cfg.eval_every_steps == 0:
+                    val_loss, val_acc = run_validation(val_loader)
+                    log.info(f"  [Val] step={step}  loss={val_loss:.4f}  "
+                             f"tok_acc={val_acc:.3f}")
+
+                    history["steps"].append(step)
+                    history["val_loss"].append(val_loss)
+                    history["val_tok_acc"].append(val_acc)
+                    history["lr"].append(current_lr)
+
+                    # ── Best model / early stopping (per stage) ──────────
+                    is_best = val_loss < best_val_loss
+                    if is_best:
+                        best_val_loss    = val_loss
+                        patience_counter = 0
+                    else:
+                        patience_counter += 1
+                        log.info(f"  [EarlyStopping] patience {patience_counter}/{train_cfg.patience}")
+                        if patience_counter >= train_cfg.patience:
+                            log.info("  Early stopping triggered for this stage.")
+                            break
+
+                    # ── Checkpoint ─────────────────────────────────────────
+                    save_checkpoint(
+                        model=model,
+                        optimizer=optimizer,
+                        step=step,
+                        val_loss=val_loss,
+                        cfg_model_dict=model_cfg.__dict__,
+                        cfg_train_dict=train_cfg.__dict__,
+                        tokenizer_path=tok_path,
+                        checkpoint_dir=train_cfg.checkpoint_dir,
+                        keep_last_n=train_cfg.keep_last_n,
+                        is_best=is_best,
+                        data_source_info=source_info,
+                    )
+
                 step += 1
+            else:
                 continue
-
-            # ── Backward pass ────────────────────────────────────────────
-            scaler.scale(loss).backward()
-
-            # Gradient clipping prevents parameter updates that are too large.
-            # We unscale first so the clip threshold is in the correct units.
-            scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(model.parameters(), train_cfg.grad_clip)
-
-            scaler.step(optimizer)
-            scaler.update()
-
-            # ── Accumulate running stats ─────────────────────────────────
-            running_loss += loss.item()
-            running_acc  += token_accuracy(out["logits"].detach(), labels)
-            running_n    += 1
-
-            # ── Periodic logging ─────────────────────────────────────────
-            if step % train_cfg.log_every_steps == 0 and running_n > 0:
-                avg_loss = running_loss / running_n
-                avg_acc  = running_acc  / running_n
-                elapsed  = time.time() - t_start
-                steps_remaining = train_cfg.max_steps - step
-                eta = elapsed / max(step - start_step, 1) * steps_remaining
-                log.info(
-                    f"Step {step:6d}/{train_cfg.max_steps}  "
-                    f"loss={avg_loss:.4f}  tok_acc={avg_acc:.3f}  "
-                    f"lr={current_lr:.2e}  "
-                    f"elapsed={format_duration(elapsed)}  "
-                    f"ETA={format_duration(eta)}"
-                )
-                running_loss = 0.0
-                running_acc  = 0.0
-                running_n    = 0
-
-            # ── Periodic validation ──────────────────────────────────────
-            if step % train_cfg.eval_every_steps == 0:
-                val_loss, val_acc = run_validation()
-                log.info(f"  [Val] step={step}  loss={val_loss:.4f}  "
-                         f"tok_acc={val_acc:.3f}")
-
-                history["steps"].append(step)
-                history["val_loss"].append(val_loss)
-                history["val_tok_acc"].append(val_acc)
-                history["lr"].append(current_lr)
-
-                # ── Best model / early stopping ─────────────────────────
-                is_best = val_loss < best_val_loss
-                if is_best:
-                    best_val_loss    = val_loss
-                    patience_counter = 0
-                else:
-                    patience_counter += 1
-                    log.info(f"  [EarlyStopping] patience {patience_counter}/{train_cfg.patience}")
-                    if patience_counter >= train_cfg.patience:
-                        log.info("  Early stopping triggered.")
-                        _save_final_and_history(
-                            model, optimizer, step, best_val_loss,
-                            model_cfg, train_cfg, tok_path, history, source_info,
-                        )
-                        return history
-
-                # ── Checkpoint ───────────────────────────────────────────
-                save_checkpoint(
-                    model=model,
-                    optimizer=optimizer,
-                    step=step,
-                    val_loss=val_loss,
-                    cfg_model_dict=model_cfg.__dict__,
-                    cfg_train_dict=train_cfg.__dict__,
-                    tokenizer_path=tok_path,
-                    checkpoint_dir=train_cfg.checkpoint_dir,
-                    keep_last_n=train_cfg.keep_last_n,
-                    is_best=is_best,
-                    data_source_info=source_info,
-                )
-
-            step += 1
+            break   # patience break above also exits the stage's epoch loop
 
     # ── End of training ──────────────────────────────────────────────────────
-    log.info(f"Training complete. Best val loss: {best_val_loss:.4f}")
+    log.info(f"Training complete. Best val loss (final stage): {best_val_loss:.4f}")
     _save_final_and_history(
         model, optimizer, step, best_val_loss,
         model_cfg, train_cfg, tok_path, history, source_info,
@@ -418,6 +502,11 @@ def parse_args():
                    help="Override batch_size from preset")
     p.add_argument("--lr", type=float, default=None,
                    help="Override learning rate")
+    p.add_argument("--curriculum", default="none",
+                   choices=["none", "default", "fast", "thorough"],
+                   help="Train easy-to-hard by number length instead of a "
+                        "flat step budget (see config.get_curriculum). "
+                        "Overrides --max-steps with the preset's own total.")
     p.add_argument("--device", default="cuda",
                    help="Device: cuda / cpu")
     return p.parse_args()
@@ -435,6 +524,7 @@ if __name__ == "__main__":
     if args.batch_size: train_cfg.batch_size = args.batch_size
     if args.lr:         train_cfg.learning_rate = args.lr
     train_cfg.device = args.device
+    train_cfg.curriculum = get_curriculum(args.curriculum)
 
     # Select data stage
     if args.stage == "1":

@@ -665,16 +665,43 @@ checkpoints/tokenizer.json       — vocabulary file
 **If 100% accuracy is not reached on the first run:**
 
 1. Check `results/eval_results.json` for failure patterns.
-2. Try a larger model (`medium-5M` or `large-10M`).
-3. Train for more steps (use `--train thorough` or increase `--max-steps`).
-4. Add more data categories (`--stage 2` or `--stage 3`).
-5. Use beam search at evaluation (`--beam-size 4`).
-6. Run `python experiments.py --analyse` for a failure analysis.
+2. Try `--curriculum default` (see below) — usually the single biggest lever for exact-answer accuracy specifically.
+3. Try a larger model (`medium-5M` or `large-10M`).
+4. Train for more steps (`--curriculum thorough`, or `--train thorough` without a curriculum).
+5. Add more data categories (`--stage 2` or `--stage 3`).
+6. Use beam search at evaluation (`--beam-size 4`).
+7. Run `python experiments.py --analyse` for a failure analysis.
+
+### Curriculum training (easy → hard by number length)
+
+A character-level model has no built-in notion of place value — it has to
+learn digit-by-digit carrying purely from examples. Training on the full
+real dataset from step 0 (numbers up to 8 digits, many decimal places)
+makes exact-answer accuracy stay low for a long time even as loss falls
+steadily, because every single digit position has to be right
+simultaneously for an answer to count as correct.
+
+`--curriculum` restricts training to short numbers first, then
+progressively lifts the restriction — using the same REAL data throughout,
+just a different (verified non-empty) subset at each stage:
+
+```bash
+python train.py --model small-2M --stage 1 --curriculum default
+```
+
+Presets (`none` / `default` / `fast` / `thorough`) are defined in
+`config.get_curriculum()`, calibrated against the actual digit-length
+distribution of the real `train-easy` data (not guessed) so every stage
+has thousands of matching examples. The cosine LR schedule spans the
+curriculum's full step budget continuously — it does not reset at stage
+transitions.
 
 **Potential improvements:**
 
 - Sub-word tokenization (better number handling)
-- Curriculum learning (easy → hard examples)
+- Reversed-digit answer representation (a well-known trick for char-level
+  arithmetic: generating the least-significant digit first lets carries
+  propagate in the same left-to-right order the model already generates in)
 - Chain-of-thought training (intermediate steps)
 - Data augmentation (more number combinations)
 - Larger model with more training compute

@@ -69,6 +69,7 @@ At inference time we feed <Q>…<A> and let the model generate the rest.
 import hashlib
 import os
 import random
+import re
 import tarfile
 import urllib.request
 from typing import List, Dict, Tuple, Optional
@@ -392,6 +393,68 @@ def check_split_overlap(
         print("  OK — zero overlap between all splits.")
 
     return report
+
+
+# ---------------------------------------------------------------------------
+# Curriculum filtering by number length
+# ---------------------------------------------------------------------------
+#
+# A character-level model has to learn digit-by-digit carrying from scratch
+# — there is no built-in notion of place value. That is much easier to
+# learn from short numbers first (single/double digits) than by throwing
+# 8-digit, multi-decimal-place arithmetic at it from step 0. These helpers
+# support training a curriculum: easy (short numbers) -> hard (full range).
+
+_NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
+
+
+def _max_digit_lengths(text: str) -> Tuple[int, int]:
+    """
+    Scan `text` for every number and return
+    (max integer-part digit count, max decimal-part digit count) seen.
+    E.g. "What is -123.45 + 6?" -> (3, 2)  (from "-123.45"; "6" contributes (1, 0))
+    """
+    max_int_digits = 0
+    max_dec_digits = 0
+    for m in _NUMBER_RE.finditer(text):
+        num = m.group().lstrip("-")
+        if "." in num:
+            int_part, dec_part = num.split(".", 1)
+        else:
+            int_part, dec_part = num, ""
+        max_int_digits = max(max_int_digits, len(int_part))
+        max_dec_digits = max(max_dec_digits, len(dec_part))
+    return max_int_digits, max_dec_digits
+
+
+def filter_by_number_length(
+    items: List[Dict],
+    max_int_digits: Optional[int] = None,
+    max_decimal_digits: Optional[int] = None,
+) -> List[Dict]:
+    """
+    Keep only items where EVERY number appearing in the question or answer
+    has at most `max_int_digits` digits before the decimal point and
+    `max_decimal_digits` digits after it. Either bound may be None to
+    leave that dimension unrestricted.
+
+    This is a pure filter over already-loaded REAL data — it does not
+    generate or alter any example, just selects a subset by difficulty.
+    """
+    if max_int_digits is None and max_decimal_digits is None:
+        return list(items)
+
+    out = []
+    for item in items:
+        int_digits, dec_digits = _max_digit_lengths(
+            item["question"] + " " + item["answer"]
+        )
+        if max_int_digits is not None and int_digits > max_int_digits:
+            continue
+        if max_decimal_digits is not None and dec_digits > max_decimal_digits:
+            continue
+        out.append(item)
+    return out
 
 
 # ---------------------------------------------------------------------------
