@@ -244,6 +244,43 @@ def _normalise(s: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Reconstruct the DataConfig a checkpoint was actually trained with
+# ---------------------------------------------------------------------------
+
+def _reconstruct_data_cfg_from_checkpoint(raw: Dict) -> DataConfig:
+    """
+    Build a DataConfig matching whatever dataset the checkpoint recorded in
+    its data_source_info (see dataset.load_split_dataset / train.py) —
+    real vs. generated, with the exact categories / digit range used.
+    Falls back to a plain default DataConfig (real dataset) with a warning
+    for older checkpoints saved before data_source_info existed.
+    """
+    info = raw.get("data_source_info") or {}
+    source = info.get("data_source")
+    config = info.get("configuration", {})
+    cfg = DataConfig()
+
+    if source == "GENERATED":
+        cfg.dataset_source = "generated"
+        cfg.generated_ops = config.get("ops", cfg.generated_ops)
+        cfg.generated_min_digits = config.get("min_digits", cfg.generated_min_digits)
+        cfg.generated_max_digits = config.get("max_digits", cfg.generated_max_digits)
+    elif source == "REAL":
+        cfg.dataset_source = "real"
+        cfg.active_categories = config.get("active_categories", cfg.active_categories)
+        cfg.train_difficulty = config.get("train_difficulty", cfg.train_difficulty)
+        cfg.test_difficulty = config.get("test_difficulty", cfg.test_difficulty)
+    else:
+        log.warning(
+            "Checkpoint has no data_source_info (older checkpoint?) — "
+            "falling back to the default real DataConfig(). If this "
+            "checkpoint was trained with --dataset-source generated, pass "
+            "a matching data_cfg explicitly or results will be meaningless."
+        )
+    return cfg
+
+
+# ---------------------------------------------------------------------------
 # Full evaluation pipeline
 # ---------------------------------------------------------------------------
 
@@ -285,9 +322,13 @@ def full_evaluation(
     tok_path = raw.get("tokenizer_path", "checkpoints/tokenizer.json")
     tokenizer = MathTokenizer.load(tok_path)
 
-    # ── Rebuild data (real dataset; we only need the test split here) ──────
+    # ── Rebuild data, matching whatever the checkpoint was actually trained
+    #    on (real dataset vs. generated benchmark, and which categories /
+    #    digit range) — evaluating against the WRONG source silently gives
+    #    meaningless results (mismatched vocab/test set), so this is not
+    #    optional when data_cfg isn't explicitly passed in.
     if data_cfg is None:
-        data_cfg = DataConfig()
+        data_cfg = _reconstruct_data_cfg_from_checkpoint(raw)
 
     _, _, test_items, source_info = load_split_dataset(data_cfg)
 
@@ -394,7 +435,12 @@ def parse_args():
                    help="Path to model checkpoint")
     p.add_argument("--device",     default="cuda")
     p.add_argument("--max-new-tokens", type=int, default=64)
-    p.add_argument("--stage",      default="1", choices=["1", "2", "3"])
+    p.add_argument("--stage",      default=None, choices=["1", "2", "3"],
+                   help="Real-dataset category stage. By default the "
+                        "dataset config (real vs generated, categories, "
+                        "digit range) is read straight from the "
+                        "checkpoint's data_source_info — only pass this to "
+                        "explicitly OVERRIDE what the checkpoint recorded.")
     p.add_argument("--show-failures", type=int, default=10)
     return p.parse_args()
 
@@ -402,16 +448,22 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
 
-    data_cfg = DataConfig()
-    if args.stage == "1":
-        data_cfg.active_categories = data_cfg.categories_stage1
-    elif args.stage == "2":
-        data_cfg.active_categories = (data_cfg.categories_stage1
-                                      + data_cfg.categories_stage2)
-    else:
-        data_cfg.active_categories = (data_cfg.categories_stage1
-                                      + data_cfg.categories_stage2
-                                      + data_cfg.categories_stage3)
+    # By default, data_cfg=None lets full_evaluation() reconstruct the
+    # exact dataset config the checkpoint was trained with (see
+    # _reconstruct_data_cfg_from_checkpoint). Only build one here if the
+    # user explicitly asked to override via --stage.
+    data_cfg = None
+    if args.stage is not None:
+        data_cfg = DataConfig()
+        if args.stage == "1":
+            data_cfg.active_categories = data_cfg.categories_stage1
+        elif args.stage == "2":
+            data_cfg.active_categories = (data_cfg.categories_stage1
+                                          + data_cfg.categories_stage2)
+        else:
+            data_cfg.active_categories = (data_cfg.categories_stage1
+                                          + data_cfg.categories_stage2
+                                          + data_cfg.categories_stage3)
 
     full_evaluation(
         checkpoint_path=args.checkpoint,

@@ -263,6 +263,45 @@ class DataConfig:
     pad_token: str = "<PAD>"
     unk_token: str = "<UNK>"
 
+    # ---- Dataset source selector --------------------------------------------
+    # "real"      : the DeepMind Mathematics Dataset (default; see above).
+    # "generated" : a controlled, Python-generated arithmetic benchmark
+    #               (see dataset.generate_controlled_dataset) — chosen when
+    #               you want a bounded, easy-to-reach-high-accuracy target
+    #               (e.g. only 1-4 digit numbers) rather than the full
+    #               difficulty range of the real dataset. Every equation's
+    #               ground truth is still exact real arithmetic (computed
+    #               once at generation time, in Python, to build the
+    #               training corpus) — this is not the same thing as the
+    #               earlier bug's silent, mislabelled synthetic fallback:
+    #               it is an explicit, clearly-labelled choice, and
+    #               source_info['data_source'] always says "GENERATED"
+    #               (never "REAL") when this path is used.
+    dataset_source: str = "real"
+
+    # ---- Generated-arithmetic controls (only used if dataset_source ==
+    #      "generated") ------------------------------------------------------
+    # Operators to include. "+"/"-"/"*" are the usual operations; "/" is
+    # ALWAYS exact integer division (we generate divisor and quotient
+    # first and multiply them to get the dividend, so there is never a
+    # remainder/decimal to represent) — deliberately not the arbitrary
+    # decimal division the real dataset has, so the model isn't learning
+    # digit-carrying AND decimal placement at the same time.
+    generated_ops: List[str] = field(default_factory=lambda: ["+", "-", "*", "/"])
+    # Final-benchmark digit range: every operand has between
+    # generated_min_digits and generated_max_digits digits.
+    generated_min_digits: int = 1
+    generated_max_digits: int = 4
+    # How many examples to generate per operator (before train/val split).
+    generated_train_samples_per_op: int = 5_000
+    generated_test_samples_per_op: int = 500
+    # Train and test are generated from DIFFERENT RNG seeds/streams (not
+    # just split from one pool) so they are independent by construction;
+    # check_split_overlap() still verifies (never just assumes) zero
+    # overlap on top of that.
+    generated_train_seed: int = 42
+    generated_test_seed: int = 20242
+
 
 # ---------------------------------------------------------------------------
 # Named experiment presets
@@ -347,6 +386,18 @@ def get_curriculum(name: str = "none") -> Optional[List[Dict]]:
             {"max_int_digits": 2, "max_decimal_digits": 1, "steps": 10_000},
             {"max_int_digits": 4, "max_decimal_digits": 3, "steps": 15_000},
             {"max_int_digits": None, "max_decimal_digits": None, "steps": 25_000},
+        ],
+        # Matches the generated-arithmetic benchmark's own digit range
+        # (DataConfig.generated_max_digits=4): each stage's cap is
+        # cumulative (max_int_digits=3 includes 1-2-digit examples too,
+        # not just 3-digit ones) — standard curriculum-learning practice
+        # of adding harder examples on top of, not instead of, easy ones.
+        # All examples have 0 decimal digits (integers only), so
+        # max_decimal_digits is fixed at 0 throughout.
+        "digits_1_4": [
+            {"max_int_digits": 2, "max_decimal_digits": 0, "steps": 6_000},
+            {"max_int_digits": 3, "max_decimal_digits": 0, "steps": 7_000},
+            {"max_int_digits": 4, "max_decimal_digits": 0, "steps": 7_000},
         ],
     }
     if name not in presets:

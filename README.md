@@ -696,6 +696,45 @@ has thousands of matching examples. The cosine LR schedule spans the
 curriculum's full step budget continuously — it does not reset at stage
 transitions.
 
+### Generated arithmetic benchmark (a bounded, easier target)
+
+The real dataset's full difficulty (8-digit numbers, arbitrary decimals,
+negatives) is genuinely hard for a small model to reach 95%+ exact-answer
+accuracy on — that's an architecture/task-difficulty ceiling, not a bug
+(see [Results](#results)). `--dataset-source generated` swaps in a
+**controlled, Python-generated arithmetic benchmark** instead:
+
+```
+123 + 456 = 579        (addition)
+842 - 317 = 525        (subtraction — always non-negative by construction:
+                         we don't stack "learn negative numbers" on top of
+                         "learn carrying" as a second problem)
+27 * 43 = 1161         (multiplication)
+864 / 24 = 36          (division — ALWAYS exact integer division: we pick
+                         the divisor and quotient first and multiply them
+                         to get the dividend, so there's never a decimal/
+                         remainder to represent either)
+```
+
+Every equation is still real, exact arithmetic (computed once, in Python,
+to build the corpus) — this is an explicit, clearly-labelled data source,
+never a silent substitution: `source_info['data_source']` always says
+`"GENERATED"` here, `"REAL"` for the DeepMind dataset, never confused.
+Train and test are generated from **independent RNG seeds** (not split
+from one shared pool), and `check_split_overlap()` still verifies zero
+overlap on top of that rather than just assuming independence guarantees it.
+
+```bash
+python train.py --model small-2M --curriculum digits_1_4 \
+    --dataset-source generated --min-digits 1 --max-digits 4
+```
+
+`digits_1_4` ramps the operand digit cap 2 → 3 → 4 (cumulative — each
+stage adds harder examples on top of, not instead of, the easier ones),
+matching `--max-digits 4`. `evaluate.py`/`generate.py` automatically read
+which dataset a checkpoint was trained on from its saved `data_source_info`
+— you don't need to re-specify `--dataset-source` at eval time.
+
 **Potential improvements:**
 
 - Sub-word tokenization (better number handling)

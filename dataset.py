@@ -320,9 +320,10 @@ def split_train_val(
     cfg: DataConfig,
 ) -> Tuple[List[Dict], List[Dict]]:
     """
-    Split the train-easy pool into train/val using a deterministic hash of
+    Split a training pool into train/val using a deterministic hash of
     the question string, so re-running the pipeline never reshuffles an
-    example into a different split.
+    example into a different split. Source-agnostic — used for both the
+    real train-easy pool and the generated-arithmetic pool.
     """
     train, val = [], []
     train_cutoff = int(cfg.train_ratio * 100)   # e.g. 90
@@ -335,8 +336,7 @@ def split_train_val(
             else:
                 val.append(item)
 
-    print(f"[Dataset] Train/Val split (from '{cfg.train_difficulty}'): "
-          f"train={len(train)}  val={len(val)}")
+    print(f"[Dataset] Train/Val split: train={len(train)}  val={len(val)}")
     return train, val
 
 
@@ -455,6 +455,189 @@ def filter_by_number_length(
             continue
         out.append(item)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Controlled, Python-generated arithmetic benchmark
+# ---------------------------------------------------------------------------
+#
+# An explicit, clearly-labelled alternative to the real DeepMind dataset for
+# when you want a bounded difficulty range (e.g. only 1-4 digit numbers)
+# instead of the full range. Every example's ground truth is exact,
+# ordinary arithmetic computed once here to build the corpus — this is NOT
+# the same thing as the original bug (silently substituting synthetic data
+# while claiming "REAL"): it is an explicit choice, and the returned
+# source_info always says "GENERATED", never "REAL".
+
+_OP_CATEGORY = {"+": "generated__add", "-": "generated__sub",
+                "*": "generated__mul", "/": "generated__div"}
+
+
+def _sample_number(rng: random.Random, min_digits: int, max_digits: int) -> int:
+    """
+    Sample an integer by first picking a digit count uniformly in
+    [min_digits, max_digits], then a value uniformly within that digit
+    count. This (rather than sampling uniformly over the whole numeric
+    range) keeps short numbers well-represented — e.g. a "1-2 digit" stage
+    is roughly half 1-digit and half 2-digit examples, not overwhelmingly
+    2-digit ones.
+    """
+    digits = rng.randint(min_digits, max_digits)
+    if digits <= 1:
+        return rng.randint(0, 9)
+    lo = 10 ** (digits - 1)
+    hi = 10 ** digits - 1
+    return rng.randint(lo, hi)
+
+
+def _generate_one_example(rng: random.Random, op: str, min_digits: int, max_digits: int) -> Optional[Dict]:
+    """
+    Generate one (question, answer) pair for operator `op`, with operands
+    in the given digit range. Returns None for a rejected draw (e.g. a
+    zero divisor) so the caller can just retry.
+
+    - Subtraction is constructed so a >= b: the result is never negative.
+      This is a deliberate simplification (matching the "control
+      difficulty directly" goal) — carrying/borrowing is hard enough to
+      learn without also learning negative-number notation at the same
+      time. Flip this if you want signed subtraction later.
+    - Division is always EXACT integer division: we pick the divisor and
+      quotient from the digit range and multiply them to get the
+      dividend, so there is never a remainder or decimal point to
+      represent. The dividend (shown in the question) will typically have
+      MORE digits than the range, same as multiplication's product — an
+      inherent property of the operation, not a bug.
+    """
+    if op == "+":
+        a = _sample_number(rng, min_digits, max_digits)
+        b = _sample_number(rng, min_digits, max_digits)
+        return {"question": f"{a} + {b}", "answer": str(a + b)}
+    if op == "-":
+        a = _sample_number(rng, min_digits, max_digits)
+        b = _sample_number(rng, min_digits, max_digits)
+        if a < b:
+            a, b = b, a
+        return {"question": f"{a} - {b}", "answer": str(a - b)}
+    if op == "*":
+        a = _sample_number(rng, min_digits, max_digits)
+        b = _sample_number(rng, min_digits, max_digits)
+        return {"question": f"{a} * {b}", "answer": str(a * b)}
+    if op == "/":
+        b = _sample_number(rng, max(1, min_digits), max_digits)
+        q = _sample_number(rng, min_digits, max_digits)
+        if b == 0:
+            return None
+        a = b * q
+        return {"question": f"{a} / {b}", "answer": str(q)}
+    raise ValueError(f"Unknown operator {op!r}")
+
+
+def _generate_unique_pool(
+    rng: random.Random,
+    n: int,
+    op: str,
+    min_digits: int,
+    max_digits: int,
+    exclude: Optional[set] = None,
+) -> List[Dict]:
+    """
+    Generate up to `n` de-duplicated examples for one operator, optionally
+    excluding any question string already present in `exclude` (used to
+    keep the test pool disjoint from train even though they're drawn from
+    independent RNG streams).
+    """
+    exclude = exclude or set()
+    seen: set = set()
+    items: List[Dict] = []
+    max_attempts = max(n * 50, 1000)
+    attempts = 0
+    while len(items) < n and attempts < max_attempts:
+        attempts += 1
+        ex = _generate_one_example(rng, op, min_digits, max_digits)
+        if ex is None:
+            continue
+        q = ex["question"]
+        if q in seen or q in exclude:
+            continue
+        seen.add(q)
+        ex["category"] = _OP_CATEGORY[op]
+        items.append(ex)
+
+    if len(items) < n:
+        print(f"[Dataset] WARNING: only generated {len(items)}/{n} unique "
+              f"'{op}' examples in digit range [{min_digits},{max_digits}] "
+              f"after {attempts} attempts (the digit range may be too "
+              f"narrow to fit this many unique examples).")
+    return items
+
+
+def generate_controlled_dataset(
+    cfg: DataConfig,
+) -> Tuple[List[Dict], List[Dict], List[Dict], Dict]:
+    """
+    Build a controlled, Python-generated arithmetic benchmark: same
+    (train_items, val_items, test_items, source_info) shape as
+    load_split_dataset(), so it's a drop-in alternative data source.
+
+    Train and test are generated from INDEPENDENT RNG seeds (not split
+    from one shared pool), and test generation additionally excludes any
+    question that landed in the train pool, so overlap is prevented by
+    construction as well as verified afterwards by check_split_overlap().
+    """
+    ops = cfg.generated_ops
+    min_d, max_d = cfg.generated_min_digits, cfg.generated_max_digits
+
+    train_rng = random.Random(cfg.generated_train_seed)
+    test_rng  = random.Random(cfg.generated_test_seed)
+
+    train_pool: Dict[str, List[Dict]] = {}
+    test_pool: Dict[str, List[Dict]] = {}
+
+    print(f"[Dataset] Generating controlled arithmetic benchmark: "
+          f"ops={ops}  digits=[{min_d},{max_d}]")
+    for op in ops:
+        cat = _OP_CATEGORY[op]
+        train_items_op = _generate_unique_pool(
+            train_rng, cfg.generated_train_samples_per_op, op, min_d, max_d,
+        )
+        train_questions = {it["question"] for it in train_items_op}
+        test_items_op = _generate_unique_pool(
+            test_rng, cfg.generated_test_samples_per_op, op, min_d, max_d,
+            exclude=train_questions,
+        )
+        train_pool[cat] = train_items_op
+        test_pool[cat] = test_items_op
+        print(f"  {cat:20s}  train={len(train_items_op):5d}  test={len(test_items_op):5d}")
+
+    train_items, val_items = split_train_val(train_pool, cfg)
+    test_items = flatten_pool(test_pool)
+
+    overlap = check_split_overlap(train_items, val_items, test_items)
+
+    source_info = {
+        "data_source": "GENERATED",
+        "dataset": "Controlled Python-generated arithmetic benchmark",
+        "configuration": {
+            "ops": ops,
+            "min_digits": min_d,
+            "max_digits": max_d,
+        },
+        "train_examples": len(train_items),
+        "val_examples": len(val_items),
+        "test_examples": len(test_items),
+        "overlap": overlap,
+    }
+
+    print("\n" + "=" * 60)
+    print("Data source: GENERATED (controlled Python arithmetic, not the real dataset)")
+    print(f"Dataset      : {source_info['dataset']}")
+    print(f"Configuration: ops={ops}  digits=[{min_d},{max_d}]")
+    print(f"Train examples     : {len(train_items)}")
+    print(f"Validation examples: {len(val_items)}")
+    print(f"Test examples      : {len(test_items)}  (independently generated, disjoint by construction)")
+    print("=" * 60 + "\n")
+
+    return train_items, val_items, test_items, source_info
 
 
 # ---------------------------------------------------------------------------
@@ -611,7 +794,15 @@ def load_split_dataset(
     cfg_data: DataConfig,
 ) -> Tuple[List[Dict], List[Dict], List[Dict], Dict]:
     """
-    Full real-data pipeline: download → extract → split → verify overlap.
+    Full data pipeline: load → split → verify overlap. Dispatches on
+    cfg_data.dataset_source:
+        "real"      -> download/extract the real DeepMind Mathematics Dataset
+        "generated" -> build the controlled Python-generated arithmetic
+                       benchmark (see generate_controlled_dataset)
+
+    This is the single entry point every caller (train.py, evaluate.py,
+    experiments.py, the notebook) uses — they don't need to know or care
+    which source is active; source_info always says which one was used.
 
     Returns
     -------
@@ -619,6 +810,14 @@ def load_split_dataset(
         source_info is a dict describing exactly what was loaded, suitable
         for printing / saving into checkpoints.
     """
+    if cfg_data.dataset_source == "generated":
+        return generate_controlled_dataset(cfg_data)
+    elif cfg_data.dataset_source != "real":
+        raise ValueError(
+            f"Unknown DataConfig.dataset_source {cfg_data.dataset_source!r}. "
+            f"Choose 'real' or 'generated'."
+        )
+
     train_pool, test_pool = load_real_dataset(cfg_data)
     train_items, val_items = split_train_val(train_pool, cfg_data)
     test_items = flatten_pool(test_pool)

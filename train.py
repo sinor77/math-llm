@@ -503,10 +503,21 @@ def parse_args():
     p.add_argument("--lr", type=float, default=None,
                    help="Override learning rate")
     p.add_argument("--curriculum", default="none",
-                   choices=["none", "default", "fast", "thorough"],
+                   choices=["none", "default", "fast", "thorough", "digits_1_4"],
                    help="Train easy-to-hard by number length instead of a "
                         "flat step budget (see config.get_curriculum). "
-                        "Overrides --max-steps with the preset's own total.")
+                        "Overrides --max-steps with the preset's own total. "
+                        "'digits_1_4' is calibrated for --dataset-source generated.")
+    p.add_argument("--dataset-source", default="real", choices=["real", "generated"],
+                   help="'real' = the DeepMind Mathematics Dataset (default). "
+                        "'generated' = a controlled Python-generated arithmetic "
+                        "benchmark (+,-,*,exact /) bounded to "
+                        "--min-digits..--max-digits, for an easier-to-reach "
+                        "accuracy target. --stage is ignored when this is set.")
+    p.add_argument("--min-digits", type=int, default=1,
+                   help="Generated benchmark only: minimum operand digit count")
+    p.add_argument("--max-digits", type=int, default=4,
+                   help="Generated benchmark only: maximum operand digit count")
     p.add_argument("--device", default="cuda",
                    help="Device: cuda / cpu")
     return p.parse_args()
@@ -526,22 +537,32 @@ if __name__ == "__main__":
     train_cfg.device = args.device
     train_cfg.curriculum = get_curriculum(args.curriculum)
 
-    # Select data stage
-    if args.stage == "1":
-        data_cfg.active_categories = data_cfg.categories_stage1
-    elif args.stage == "2":
-        data_cfg.active_categories = (data_cfg.categories_stage1
-                                      + data_cfg.categories_stage2)
-    else:
-        data_cfg.active_categories = (data_cfg.categories_stage1
-                                      + data_cfg.categories_stage2
-                                      + data_cfg.categories_stage3)
+    data_cfg.dataset_source = args.dataset_source
 
-    log.info(f"=== Math LLM Training ===")
-    log.info(f"Model   : {args.model}")
-    log.info(f"Preset  : {args.train}")
-    log.info(f"Stage   : {args.stage}")
-    log.info(f"Cats    : {data_cfg.active_categories}")
+    if args.dataset_source == "generated":
+        data_cfg.generated_min_digits = args.min_digits
+        data_cfg.generated_max_digits = args.max_digits
+        log.info(f"=== Math LLM Training ===")
+        log.info(f"Model   : {args.model}")
+        log.info(f"Preset  : {args.train}")
+        log.info(f"Source  : generated  (digits {args.min_digits}-{args.max_digits})")
+    else:
+        # Select data stage (real dataset only)
+        if args.stage == "1":
+            data_cfg.active_categories = data_cfg.categories_stage1
+        elif args.stage == "2":
+            data_cfg.active_categories = (data_cfg.categories_stage1
+                                          + data_cfg.categories_stage2)
+        else:
+            data_cfg.active_categories = (data_cfg.categories_stage1
+                                          + data_cfg.categories_stage2
+                                          + data_cfg.categories_stage3)
+
+        log.info(f"=== Math LLM Training ===")
+        log.info(f"Model   : {args.model}")
+        log.info(f"Preset  : {args.train}")
+        log.info(f"Stage   : {args.stage}")
+        log.info(f"Cats    : {data_cfg.active_categories}")
 
     try:
         history = train(model_cfg, train_cfg, data_cfg, resume_from=args.resume)
