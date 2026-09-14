@@ -121,7 +121,7 @@ def evaluate_exact_answer(
     tokenizer:      MathTokenizer,
     items:          List[Dict],          # list of {"question":..,"answer":..,"category":..}
     device:         torch.device,
-    max_new_tokens: int = 64,
+    max_new_tokens: int = 160,
     beam_size:      int = 1,            # 1 = greedy; >1 = beam search
     temperature:    float = 0.0,        # 0 = greedy
     show_n:         int = 5,            # number of examples to print
@@ -268,6 +268,7 @@ def _reconstruct_data_cfg_from_checkpoint(raw: Dict) -> DataConfig:
         cfg.generated_min_digits = config.get("min_digits", cfg.generated_min_digits)
         cfg.generated_max_digits = config.get("max_digits", cfg.generated_max_digits)
         cfg.generated_reverse_answer = config.get("reverse_answer", cfg.generated_reverse_answer)
+        cfg.generated_mul_cot = config.get("mul_cot", cfg.generated_mul_cot)
     elif source == "REAL":
         cfg.dataset_source = "real"
         cfg.active_categories = config.get("active_categories", cfg.active_categories)
@@ -291,7 +292,7 @@ def full_evaluation(
     checkpoint_path: str,
     data_cfg: Optional[DataConfig] = None,
     device_str: str = "cuda",
-    max_new_tokens: int = 64,
+    max_new_tokens: int = 160,
     show_failures: int = 10,
 ) -> Dict:
     """
@@ -445,7 +446,7 @@ def parse_args():
     p.add_argument("--checkpoint", default="checkpoints/best_model.pt",
                    help="Path to model checkpoint")
     p.add_argument("--device",     default="cuda")
-    p.add_argument("--max-new-tokens", type=int, default=64)
+    p.add_argument("--max-new-tokens", type=int, default=160)
     p.add_argument("--stage",      default=None, choices=["1", "2", "3"],
                    help="Real-dataset category stage. By default the "
                         "dataset config (real vs generated, categories, "

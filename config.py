@@ -316,6 +316,27 @@ class DataConfig:
     # need one more digit" be decided naturally at the END of generation.
     generated_reverse_answer: bool = False
 
+    # Chain-of-thought (long-multiplication) formatting for the "*" operator
+    # only. Measured result WITHOUT this: add/sub reached 95.8%/99.4% (with
+    # reverse_answer) but mul stayed at 20.0% even after the same fix and a
+    # long curriculum — multiplying two 4-digit numbers has no local
+    # digit-by-digit pattern the way carrying does; the model has to
+    # implicitly compute cross-digit partial products and sum them, all in
+    # one shot. This decomposes that into the actual long-multiplication
+    # algorithm, written out as training text: one partial product per
+    # nonzero digit of the second operand, then a running sum down to the
+    # final answer, e.g.
+    #     23 * 45  ->  "23*5=115,23*40=920,115+920=1035"
+    # This reduces multiplication to two sub-problems the model can already
+    # do: multiply a multi-digit number by a SINGLE digit (far simpler than
+    # full multi-digit x multi-digit), and add a short list of numbers
+    # (already ~95%+ solved). Only the final "=result" after the last comma
+    # is scored as the answer (see evaluate.py); item["answer"] is
+    # unaffected. Same divide-and-conquer idea as
+    # github.com/brendanlong/math-llm's chain-of-thought approach.
+    generated_mul_cot: bool = False
+
+
 
 # ---------------------------------------------------------------------------
 # Named experiment presets

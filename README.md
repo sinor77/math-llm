@@ -766,12 +766,60 @@ full chain-of-thought reasoning) is used by
 [brendanlong/math-llm](https://github.com/brendanlong/math-llm) for
 exactly this reason, which independently corroborates it.
 
+### Multiplication chain-of-thought (`--mul-cot`)
+
+Even with `--reverse-answer`, a measured run (small-2M, `digits_1_4_long`,
+`+,-,*`) got add=95.8%/sub=99.4% — both at/above the >95% target — but
+**mul stuck at only 20.0%**. Multiplication of two multi-digit numbers has
+no local digit-by-digit pattern the way carrying does: the model has to
+implicitly compute cross-digit partial products and sum them, all in one
+autoregressive shot. Neither curriculum nor reversed-digit encoding
+(both aimed at the carry-length problem) meaningfully moved it.
+
+`--mul-cot` trains `*` examples as an explicit long-multiplication chain
+of thought instead of a single-shot final answer — one partial product per
+nonzero digit of the second operand, then a running sum:
+
+```
+23 * 45   ->   23*5=115,23*40=920,115+920=1035
+91 * 7    ->   91*7=637                          (single nonzero digit: no decomposition needed)
+```
+
+This reduces multiplication to two sub-problems the model has already
+shown it can do: multiply a multi-digit number by a **single digit** (far
+simpler than full multi-digit × multi-digit), and **sum a short list of
+numbers** (already ~95%+ solved for addition). Only the text after the
+*last* `=` is scored as the answer (`generate._extract_final_answer()`);
+`item["answer"]` stays just the final numeric result throughout, and
+`--reverse-answer` composes with it (every number in the chain, not just
+the final one, is written least-significant-digit-first, via
+`dataset.reverse_digit_runs()` — the same "decide the length at the END"
+fix applied per-step instead of once). Same divide-and-conquer idea used
+by [brendanlong/math-llm](https://github.com/brendanlong/math-llm)'s
+chain-of-thought approach.
+
+Longer answers need a bigger generation budget: `generate.py`/`evaluate.py`
+default `max_new_tokens` was raised from 64 to 160 (a 4-digit × 4-digit
+chain of thought runs to ~130 characters; 64 would truncate it before the
+final `=result` was ever generated).
+
+```bash
+python train.py --model small-2M --curriculum digits_1_4_long \
+    --dataset-source generated --ops "+,-,*" --reverse-answer --mul-cot --patience 15
+```
+
+This has been verified for correctness (the chain-of-thought builder,
+digit-run reversal, and final-answer extraction all round-trip correctly
+against thousands of random cases, and a small CPU overfitting test
+reaches 40/40 exact-match generation with `--reverse-answer --mul-cot`
+together) but **not yet measured for real generalization accuracy** — that
+needs a real training run on a GPU, the same way `--reverse-answer` was
+validated. Run the command above and compare `generated__mul` accuracy
+against the 20.0% baseline.
+
 **Potential improvements:**
 
 - Sub-word tokenization (better number handling)
-- Full chain-of-thought reasoning traces (not just a reversed final
-  answer) — see brendanlong/math-llm for a working implementation of this
-  on a different, more research-oriented architecture stack
 - RL fine-tuning with a verifiable reward (exact-match) on top of a
   strong supervised base — investigated using HuggingFace TRL, but its
   `GRPOTrainer`/`PPOTrainer` require a `transformers.PreTrainedModel`
@@ -780,7 +828,6 @@ exactly this reason, which independently corroborates it.
   of the `transformers` stack. A small hand-written REINFORCE-style loop
   would fit this project's from-scratch philosophy better if this is
   pursued later.
-- Chain-of-thought training (intermediate steps)
 - Data augmentation (more number combinations)
 - Larger model with more training compute
 

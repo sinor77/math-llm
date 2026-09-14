@@ -553,6 +553,20 @@ def parse_args():
                         "github.com/brendanlong/math-llm's chain-of-"
                         "thought approach, which reverses digits for the "
                         "same reason.")
+    p.add_argument("--mul-cot", action="store_true",
+                   help="Generated benchmark only: train '*' examples as "
+                        "an explicit long-multiplication chain of thought "
+                        "(one partial product per nonzero digit of the "
+                        "second operand, then a running sum), e.g. "
+                        "'23 * 45' -> '23*5=115,23*40=920,115+920=1035'. "
+                        "A measured run WITHOUT this got add=95.8%%/"
+                        "sub=99.4%% but mul stuck at only 20.0%% even after "
+                        "the same curriculum + reverse-answer treatment — "
+                        "multiplying two multi-digit numbers has no local "
+                        "digit-by-digit pattern the way carrying does. This "
+                        "reduces it to multi-digit x single-digit "
+                        "multiplication (much easier) plus summing a short "
+                        "list of numbers (already solved for addition).")
     p.add_argument("--patience", type=int, default=None,
                    help="Override early-stopping patience (evals with no "
                         "val-loss improvement before stopping A STAGE, not "
@@ -586,13 +600,15 @@ if __name__ == "__main__":
         data_cfg.generated_min_digits = args.min_digits
         data_cfg.generated_max_digits = args.max_digits
         data_cfg.generated_reverse_answer = args.reverse_answer
+        data_cfg.generated_mul_cot = args.mul_cot
         if args.ops:
             data_cfg.generated_ops = [op.strip() for op in args.ops.split(",")]
         log.info(f"=== Math LLM Training ===")
         log.info(f"Model   : {args.model}")
         log.info(f"Preset  : {args.train}")
         log.info(f"Source  : generated  (digits {args.min_digits}-{args.max_digits}, "
-                 f"ops={data_cfg.generated_ops}, reverse_answer={args.reverse_answer})")
+                 f"ops={data_cfg.generated_ops}, reverse_answer={args.reverse_answer}, "
+                 f"mul_cot={args.mul_cot})")
     else:
         # Select data stage (real dataset only)
         if args.stage == "1":

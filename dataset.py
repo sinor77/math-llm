@@ -472,6 +472,63 @@ def filter_by_number_length(
 _OP_CATEGORY = {"+": "generated__add", "-": "generated__sub",
                 "*": "generated__mul", "/": "generated__div"}
 
+_DIGIT_RUN_RE = re.compile(r"\d+")
+
+
+def reverse_digit_runs(text: str) -> str:
+    """
+    Reverse the digits within each maximal run of digit characters in
+    `text`, leaving every non-digit character (operators, '=', ',', etc.)
+    in its original position.
+
+    Generalises the old single-number reversal (item['answer'][::-1]) to
+    a chain-of-thought string containing several numbers, e.g.:
+        "23*5=115,23*40=920,115+920=1035"
+        -> "32*5=511,32*04=029,511+029=5301"
+    For a plain digit-only string (the non-CoT case) this is identical to
+    reversing the whole string, so it is a drop-in replacement.
+    Only ever applied to the TRAINING TEXT — never mutates item["answer"]
+    or item["cot"] themselves.
+    """
+    return _DIGIT_RUN_RE.sub(lambda m: m.group()[::-1], text)
+
+
+def _build_mul_chain_of_thought(a: int, b: int) -> str:
+    """
+    Build an explicit long-multiplication chain-of-thought training string
+    for a * b: one partial product per nonzero digit of b (most-significant
+    digits included via their place value, e.g. the tens digit contributes
+    "a*NN0"), then a running sum reducing those partial products down to
+    the final answer.
+
+    Example: 23 * 45 -> "23*5=115,23*40=920,115+920=1035"
+    Example: 91 * 7  -> "91*7=637"                (single nonzero digit —
+                                                     no decomposition needed)
+    Example: a * 0   -> "a*0=0"                    (degenerate, no digits)
+
+    The final answer is always whatever follows the LAST '=' in the
+    returned string — see generate._extract_final_answer().
+    """
+    b_digits = [int(c) for c in str(b)]
+    terms = []
+    for place, digit in enumerate(reversed(b_digits)):
+        if digit == 0:
+            continue
+        place_value = digit * (10 ** place)
+        partial = a * place_value
+        terms.append((place_value, partial))
+
+    if not terms:
+        return f"{a}*{b}=0"
+
+    steps = [f"{a}*{pv}={val}" for pv, val in terms]
+    running = terms[0][1]
+    for _, val in terms[1:]:
+        prev = running
+        running += val
+        steps.append(f"{prev}+{val}={running}")
+    return ",".join(steps)
+
 
 def _sample_number(rng: random.Random, min_digits: int, max_digits: int) -> int:
     """
@@ -490,7 +547,10 @@ def _sample_number(rng: random.Random, min_digits: int, max_digits: int) -> int:
     return rng.randint(lo, hi)
 
 
-def _generate_one_example(rng: random.Random, op: str, min_digits: int, max_digits: int) -> Optional[Dict]:
+def _generate_one_example(
+    rng: random.Random, op: str, min_digits: int, max_digits: int,
+    mul_cot: bool = False,
+) -> Optional[Dict]:
     """
     Generate one (question, answer) pair for operator `op`, with operands
     in the given digit range. Returns None for a rejected draw (e.g. a
@@ -507,6 +567,10 @@ def _generate_one_example(rng: random.Random, op: str, min_digits: int, max_digi
       represent. The dividend (shown in the question) will typically have
       MORE digits than the range, same as multiplication's product — an
       inherent property of the operation, not a bug.
+    - Multiplication optionally attaches a long-multiplication chain-of-
+      thought (item["cot"]) when mul_cot=True — see
+      _build_mul_chain_of_thought(). item["answer"] is always just the
+      final numeric result either way.
     """
     if op == "+":
         a = _sample_number(rng, min_digits, max_digits)
@@ -521,7 +585,10 @@ def _generate_one_example(rng: random.Random, op: str, min_digits: int, max_digi
     if op == "*":
         a = _sample_number(rng, min_digits, max_digits)
         b = _sample_number(rng, min_digits, max_digits)
-        return {"question": f"{a} * {b}", "answer": str(a * b)}
+        item = {"question": f"{a} * {b}", "answer": str(a * b)}
+        if mul_cot:
+            item["cot"] = _build_mul_chain_of_thought(a, b)
+        return item
     if op == "/":
         b = _sample_number(rng, max(1, min_digits), max_digits)
         q = _sample_number(rng, min_digits, max_digits)
@@ -539,6 +606,7 @@ def _generate_unique_pool(
     min_digits: int,
     max_digits: int,
     exclude: Optional[set] = None,
+    mul_cot: bool = False,
 ) -> List[Dict]:
     """
     Generate up to `n` de-duplicated examples for one operator, optionally
@@ -553,7 +621,7 @@ def _generate_unique_pool(
     attempts = 0
     while len(items) < n and attempts < max_attempts:
         attempts += 1
-        ex = _generate_one_example(rng, op, min_digits, max_digits)
+        ex = _generate_one_example(rng, op, min_digits, max_digits, mul_cot=mul_cot)
         if ex is None:
             continue
         q = ex["question"]
@@ -586,6 +654,7 @@ def generate_controlled_dataset(
     """
     ops = cfg.generated_ops
     min_d, max_d = cfg.generated_min_digits, cfg.generated_max_digits
+    mul_cot = cfg.generated_mul_cot
 
     train_rng = random.Random(cfg.generated_train_seed)
     test_rng  = random.Random(cfg.generated_test_seed)
@@ -594,16 +663,19 @@ def generate_controlled_dataset(
     test_pool: Dict[str, List[Dict]] = {}
 
     print(f"[Dataset] Generating controlled arithmetic benchmark: "
-          f"ops={ops}  digits=[{min_d},{max_d}]")
+          f"ops={ops}  digits=[{min_d},{max_d}]" +
+          ("  mul_cot=True" if mul_cot and "*" in ops else ""))
     for op in ops:
         cat = _OP_CATEGORY[op]
+        op_mul_cot = mul_cot and op == "*"
         train_items_op = _generate_unique_pool(
             train_rng, cfg.generated_train_samples_per_op, op, min_d, max_d,
+            mul_cot=op_mul_cot,
         )
         train_questions = {it["question"] for it in train_items_op}
         test_items_op = _generate_unique_pool(
             test_rng, cfg.generated_test_samples_per_op, op, min_d, max_d,
-            exclude=train_questions,
+            exclude=train_questions, mul_cot=op_mul_cot,
         )
         train_pool[cat] = train_items_op
         test_pool[cat] = test_items_op
@@ -622,6 +694,7 @@ def generate_controlled_dataset(
             "min_digits": min_d,
             "max_digits": max_d,
             "reverse_answer": cfg.generated_reverse_answer,
+            "mul_cot": mul_cot,
         },
         "train_examples": len(train_items),
         "val_examples": len(val_items),
@@ -633,7 +706,7 @@ def generate_controlled_dataset(
     print("Data source: GENERATED (controlled Python arithmetic, not the real dataset)")
     print(f"Dataset      : {source_info['dataset']}")
     print(f"Configuration: ops={ops}  digits=[{min_d},{max_d}]  "
-          f"reverse_answer={cfg.generated_reverse_answer}")
+          f"reverse_answer={cfg.generated_reverse_answer}  mul_cot={mul_cot}")
     if cfg.generated_reverse_answer:
         print("  NOTE: answers are written LEAST-SIGNIFICANT-DIGIT-FIRST in "
               "the training text (e.g. 10366 -> '66301'). item['answer'] "
@@ -641,6 +714,13 @@ def generate_controlled_dataset(
               "order — this only affects what the model is trained to "
               "generate internally; generate.generate_answer() reverses it "
               "back automatically.")
+    if mul_cot and "*" in ops:
+        print("  NOTE: multiplication ('*') examples are trained as an "
+              "explicit long-multiplication chain of thought (partial "
+              "products + running sum), e.g. '23 * 45' -> "
+              "'23*5=115,23*40=920,115+920=1035'. item['answer'] stays "
+              "just '1035'; generate.generate_answer() extracts the final "
+              "result automatically.")
     print(f"Train examples     : {len(train_items)}")
     print(f"Validation examples: {len(val_items)}")
     print(f"Test examples      : {len(test_items)}  (independently generated, disjoint by construction)")
@@ -667,22 +747,31 @@ def format_example(
         {"question": "What is 3+4?", "answer": "7"}
         →  "<Q>What is 3+4?<A>7<EOS>"
 
-    reverse_answer : if True, write the answer's characters in reverse
-        order in the TOKEN STREAM ONLY (item['answer'] itself is never
-        mutated — this is purely how the training text is built).
-        Motivated by a real, diagnosed failure: a model generating the
-        answer most-significant-digit-first has to commit to the answer's
-        length before it has seen the full carry chain, and was observed
-        systematically dropping the leading digit whenever carrying
-        produced a result one digit longer than both operands (e.g.
-        9286+3247=12533 predicted as 2533). Writing the least-significant
-        digit first lets that decision happen naturally at the END of
-        generation instead. generate.generate_answer() reverses the
-        extracted text back to normal reading order before returning it,
-        so every caller still sees/compares natural-order answers.
+    reverse_answer : if True, reverse the digits WITHIN EACH NUMBER of the
+        training text (see reverse_digit_runs() — item['answer'] and
+        item['cot'] are never mutated, this is purely how the training
+        text is built). Motivated by a real, diagnosed failure: a model
+        generating the answer most-significant-digit-first has to commit
+        to the answer's length before it has seen the full carry chain,
+        and was observed systematically dropping the leading digit
+        whenever carrying produced a result one digit longer than both
+        operands (e.g. 9286+3247=12533 predicted as 2533). Writing the
+        least-significant digit first lets that decision happen naturally
+        at the END of generation instead. generate.generate_answer()
+        reverses the extracted text back to normal reading order before
+        returning it, so every caller still sees/compares natural-order
+        answers.
+
+    If item has a "cot" field (see _build_mul_chain_of_thought — only
+    present for multiplication examples when
+    DataConfig.generated_mul_cot=True), that full chain-of-thought string
+    is used as the training text instead of the plain item['answer'];
+    item['answer'] itself is unaffected and stays just the final result.
     """
-    answer = item["answer"][::-1] if reverse_answer else item["answer"]
-    return f"{q_token}{item['question']}{a_token}{answer}{eos_token}"
+    answer_text = item.get("cot", item["answer"])
+    if reverse_answer:
+        answer_text = reverse_digit_runs(answer_text)
+    return f"{q_token}{item['question']}{a_token}{answer_text}{eos_token}"
 
 
 # ---------------------------------------------------------------------------

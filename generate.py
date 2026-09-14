@@ -49,6 +49,7 @@ import torch.nn.functional as F
 from config import ModelConfig
 from tokenizer import MathTokenizer
 from model import MathLLM
+from dataset import reverse_digit_runs
 from utils import get_logger, get_device, load_checkpoint
 
 log = get_logger()
@@ -64,7 +65,7 @@ def generate_answer(
     tokenizer:      MathTokenizer,
     question:       str,
     device:         torch.device,
-    max_new_tokens: int = 64,
+    max_new_tokens: int = 160,
     temperature:    float = 0.0,    # 0 = greedy
     top_k:          int = 0,        # 0 = disabled
     top_p:          float = 1.0,    # 1.0 = disabled (nucleus sampling)
@@ -79,32 +80,38 @@ def generate_answer(
     tokenizer      : fitted MathTokenizer
     question       : plain question string (e.g. "What is 3 + 4?")
     device         : torch device
-    max_new_tokens : maximum answer tokens to generate
+    max_new_tokens : maximum answer tokens to generate. Default raised
+        from 64 to 160 because a multiplication chain-of-thought answer
+        (DataConfig.generated_mul_cot=True) can run to ~130+ characters
+        for 4-digit x 4-digit operands (several partial-product steps
+        plus a running sum) — 64 would truncate it mid-sequence before
+        the final "=result" is ever generated.
     temperature    : sampling temperature (0 = greedy)
     top_k          : top-k filtering (0 = off)
     top_p          : nucleus sampling threshold (1.0 = off)
     reverse_answer : set True iff the model was trained with
         dataset.format_example(..., reverse_answer=True) (i.e.
         DataConfig.generated_reverse_answer) — the model then generates
-        the answer least-significant-digit-first, so the extracted text
-        must be reversed back to normal reading order before it's
-        returned. Get this from the checkpoint's data_source_info rather
-        than guessing (see evaluate._reconstruct_data_cfg_from_checkpoint).
+        every number least-significant-digit-first, so the extracted text
+        must be un-reversed (per-number, via dataset.reverse_digit_runs)
+        before it's returned. Get this from the checkpoint's
+        data_source_info rather than guessing (see
+        evaluate._reconstruct_data_cfg_from_checkpoint).
 
     Returns
     -------
     (predicted_answer, full_generation_string)
-        predicted_answer     : text between <A> and <EOS>, already in
+        predicted_answer     : just the final numeric result, already in
                                 normal reading order regardless of
-                                reverse_answer
+                                reverse_answer, with any chain-of-thought
+                                scratch work (see
+                                DataConfig.generated_mul_cot) stripped off
+                                — see _extract_final_answer().
         full_generation_string : complete generated sequence including
-                                <Q>…<A>…<EOS> — NOTE: if reverse_answer is
-                                True, the answer portion of this raw
-                                string is still in the reversed form the
-                                model actually produced (useful for
-                                debugging what the model literally
-                                generated); only the returned
-                                predicted_answer is un-reversed.
+                                <Q>…<A>…<EOS>, exactly as the model
+                                produced it (still reversed/still
+                                containing chain-of-thought steps if
+                                applicable) — useful for debugging.
     """
     model.eval()
 
@@ -174,10 +181,12 @@ def generate_answer(
     full_ids   = prompt_ids + generated_ids
     full_text  = tokenizer.decode(full_ids, skip_special_tokens=False)
 
-    # Extract just the answer: text between <A> and <EOS>
-    answer = _extract_answer(full_text)
+    # Extract the raw answer segment: text between <A> and <EOS> (may be a
+    # plain number, or a full chain-of-thought string for mul_cot).
+    raw_segment = _extract_answer(full_text)
     if reverse_answer:
-        answer = answer[::-1]
+        raw_segment = reverse_digit_runs(raw_segment)
+    answer = _extract_final_answer(raw_segment)
 
     return answer, full_text
 
@@ -205,6 +214,23 @@ def _extract_answer(text: str) -> str:
     return text[answer_start:eos_pos].strip()
 
 
+def _extract_final_answer(answer_segment: str) -> str:
+    """
+    Extract just the final numeric result from an (already un-reversed)
+    answer segment, which may be either a plain number (add/sub/div, or
+    multiplication without chain-of-thought) or a long-multiplication
+    chain of thought (DataConfig.generated_mul_cot=True), e.g.
+    "23*5=115,23*40=920,115+920=1035".
+
+    The final answer is always whatever follows the LAST '=' sign — for a
+    plain number (no '=' present at all) that's just the whole string
+    unchanged, so this is a safe no-op for every non-CoT case.
+    """
+    if "=" in answer_segment:
+        return answer_segment.rsplit("=", 1)[-1].strip()
+    return answer_segment
+
+
 # ---------------------------------------------------------------------------
 # Beam search (optional, more accurate)
 # ---------------------------------------------------------------------------
@@ -216,7 +242,7 @@ def beam_search(
     question:       str,
     device:         torch.device,
     beam_size:      int = 4,
-    max_new_tokens: int = 64,
+    max_new_tokens: int = 160,
     length_penalty: float = 1.0,
     reverse_answer: bool = False,
 ) -> Tuple[str, str]:
@@ -282,9 +308,10 @@ def beam_search(
     # Return the highest-scoring beam
     best_score, best_ids, _ = beams[0]
     full_text = tokenizer.decode(best_ids, skip_special_tokens=False)
-    answer    = _extract_answer(full_text)
+    raw_segment = _extract_answer(full_text)
     if reverse_answer:
-        answer = answer[::-1]
+        raw_segment = reverse_digit_runs(raw_segment)
+    answer = _extract_final_answer(raw_segment)
     return answer, full_text
 
 
@@ -298,7 +325,7 @@ def generate_batch(
     tokenizer:      MathTokenizer,
     questions:      List[str],
     device:         torch.device,
-    max_new_tokens: int = 64,
+    max_new_tokens: int = 160,
     temperature:    float = 0.0,
     reverse_answer: bool = False,
 ) -> List[Tuple[str, str]]:
@@ -327,7 +354,7 @@ def interactive_demo(
     model:          MathLLM,
     tokenizer:      MathTokenizer,
     device:         torch.device,
-    max_new_tokens: int = 64,
+    max_new_tokens: int = 160,
     temperature:    float = 0.0,
     reverse_answer: bool = False,
 ) -> None:
@@ -379,7 +406,7 @@ def parse_args():
     p.add_argument("--question",   default=None,
                    help="Single question to answer (non-interactive mode)")
     p.add_argument("--device",     default="cuda")
-    p.add_argument("--max-new-tokens", type=int, default=64)
+    p.add_argument("--max-new-tokens", type=int, default=160)
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--top-k",      type=int, default=0)
     p.add_argument("--beam-size",  type=int, default=1)
