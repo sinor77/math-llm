@@ -503,11 +503,15 @@ def parse_args():
     p.add_argument("--lr", type=float, default=None,
                    help="Override learning rate")
     p.add_argument("--curriculum", default="none",
-                   choices=["none", "default", "fast", "thorough", "digits_1_4"],
+                   choices=["none", "default", "fast", "thorough",
+                            "digits_1_4", "digits_1_4_long"],
                    help="Train easy-to-hard by number length instead of a "
                         "flat step budget (see config.get_curriculum). "
                         "Overrides --max-steps with the preset's own total. "
-                        "'digits_1_4' is calibrated for --dataset-source generated.")
+                        "'digits_1_4'/'digits_1_4_long' are calibrated for "
+                        "--dataset-source generated; '_long' spends most of "
+                        "the budget on the final (hardest) stage — worth it "
+                        "since this model size trains fast on a GPU.")
     p.add_argument("--dataset-source", default="real", choices=["real", "generated"],
                    help="'real' = the DeepMind Mathematics Dataset (default). "
                         "'generated' = a controlled Python-generated arithmetic "
@@ -518,6 +522,13 @@ def parse_args():
                    help="Generated benchmark only: minimum operand digit count")
     p.add_argument("--max-digits", type=int, default=4,
                    help="Generated benchmark only: maximum operand digit count")
+    p.add_argument("--patience", type=int, default=None,
+                   help="Override early-stopping patience (evals with no "
+                        "val-loss improvement before stopping A STAGE, not "
+                        "the whole run). Consider raising this for a long "
+                        "final curriculum stage (e.g. digits_1_4_long's "
+                        "68K-step stage) so a temporary plateau isn't "
+                        "mistaken for convergence.")
     p.add_argument("--device", default="cuda",
                    help="Device: cuda / cpu")
     return p.parse_args()
@@ -534,6 +545,7 @@ if __name__ == "__main__":
     if args.max_steps:  train_cfg.max_steps  = args.max_steps
     if args.batch_size: train_cfg.batch_size = args.batch_size
     if args.lr:         train_cfg.learning_rate = args.lr
+    if args.patience is not None: train_cfg.patience = args.patience
     train_cfg.device = args.device
     train_cfg.curriculum = get_curriculum(args.curriculum)
 

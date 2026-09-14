@@ -399,6 +399,21 @@ def get_curriculum(name: str = "none") -> Optional[List[Dict]]:
             {"max_int_digits": 3, "max_decimal_digits": 0, "steps": 7_000},
             {"max_int_digits": 4, "max_decimal_digits": 0, "steps": 7_000},
         ],
+        # Same ramp as "digits_1_4" but with a MUCH bigger budget for the
+        # final (full 1-4 digit range) stage. A measured run of
+        # "digits_1_4" (20K steps total: 6K/7K/7K) showed val accuracy
+        # visibly still climbing when the final stage ended — its 7K
+        # steps is enough to recover from the stage-3 distribution shift
+        # but not to converge, especially on multiplication/division
+        # (structurally harder — see README). Training this size of model
+        # for 20K steps takes well under a minute on a T4, so budget is
+        # cheap: this preset spends the bulk of it on the hardest stage
+        # instead of budgeting evenly across stages.
+        "digits_1_4_long": [
+            {"max_int_digits": 2, "max_decimal_digits": 0, "steps": 4_000},
+            {"max_int_digits": 3, "max_decimal_digits": 0, "steps": 8_000},
+            {"max_int_digits": 4, "max_decimal_digits": 0, "steps": 68_000},
+        ],
     }
     if name not in presets:
         raise ValueError(f"Unknown curriculum preset '{name}'. "
