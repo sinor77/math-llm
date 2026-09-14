@@ -522,6 +522,12 @@ def parse_args():
                    help="Generated benchmark only: minimum operand digit count")
     p.add_argument("--max-digits", type=int, default=4,
                    help="Generated benchmark only: maximum operand digit count")
+    p.add_argument("--ops", default=None,
+                   help="Generated benchmark only: comma-separated operator "
+                        "subset, e.g. '+,-,*' to exclude division for a "
+                        "first clean pass (division adds exact-integer "
+                        "constraint solving on top of carrying — worth "
+                        "isolating). Default: all of +,-,*,/.")
     p.add_argument("--patience", type=int, default=None,
                    help="Override early-stopping patience (evals with no "
                         "val-loss improvement before stopping A STAGE, not "
@@ -554,10 +560,13 @@ if __name__ == "__main__":
     if args.dataset_source == "generated":
         data_cfg.generated_min_digits = args.min_digits
         data_cfg.generated_max_digits = args.max_digits
+        if args.ops:
+            data_cfg.generated_ops = [op.strip() for op in args.ops.split(",")]
         log.info(f"=== Math LLM Training ===")
         log.info(f"Model   : {args.model}")
         log.info(f"Preset  : {args.train}")
-        log.info(f"Source  : generated  (digits {args.min_digits}-{args.max_digits})")
+        log.info(f"Source  : generated  (digits {args.min_digits}-{args.max_digits}, "
+                 f"ops={data_cfg.generated_ops})")
     else:
         # Select data stage (real dataset only)
         if args.stage == "1":

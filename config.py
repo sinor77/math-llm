@@ -408,11 +408,14 @@ def get_curriculum(name: str = "none") -> Optional[List[Dict]]:
         # (structurally harder — see README). Training this size of model
         # for 20K steps takes well under a minute on a T4, so budget is
         # cheap: this preset spends the bulk of it on the hardest stage
-        # instead of budgeting evenly across stages.
+        # instead of budgeting evenly across stages. Four stages (not
+        # three) so there's a true pure-1-digit starting point before
+        # ramping up, not just "at most 2 digits" as the easiest stage.
         "digits_1_4_long": [
+            {"max_int_digits": 1, "max_decimal_digits": 0, "steps": 2_000},
             {"max_int_digits": 2, "max_decimal_digits": 0, "steps": 4_000},
             {"max_int_digits": 3, "max_decimal_digits": 0, "steps": 8_000},
-            {"max_int_digits": 4, "max_decimal_digits": 0, "steps": 68_000},
+            {"max_int_digits": 4, "max_decimal_digits": 0, "steps": 66_000},
         ],
     }
     if name not in presets:
