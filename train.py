@@ -147,10 +147,25 @@ def train(
     start_step = 0
     best_val_loss = float("inf")
     if resume_from:
-        ckpt = load_checkpoint(resume_from, model, optimizer, device)
-        start_step    = ckpt.get("step", 0) + 1
-        best_val_loss = ckpt.get("val_loss", float("inf"))
-        log.info(f"Resuming from step {start_step}")
+        try:
+            ckpt = load_checkpoint(resume_from, model, optimizer, device)
+            start_step    = ckpt.get("step", 0) + 1
+            best_val_loss = ckpt.get("val_loss", float("inf"))
+            log.info(f"Resuming from step {start_step}")
+        except RuntimeError as exc:
+            # Most common cause: the checkpoint was trained with a different
+            # vocabulary (e.g. a different operator set, or a different
+            # mul_cot/reverse_answer setting) than this run's config, so its
+            # embedding/output-head shapes no longer match this model. That
+            # is a configuration change, not a corrupt file -- starting
+            # fresh from step 0 is the correct recovery, not a crash.
+            log.warning(
+                f"Could not resume from {resume_from!r}: {exc}\n"
+                f"This usually means the checkpoint was trained with a "
+                f"different vocabulary (a different operator set, or a "
+                f"different mul_cot/reverse_answer setting) than this run's "
+                f"config. Starting fresh from step 0 instead of resuming."
+            )
 
     # ── Training state ───────────────────────────────────────────────────────
     history = {
